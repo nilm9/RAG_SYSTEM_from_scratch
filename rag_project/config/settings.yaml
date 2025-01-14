@@ -1,0 +1,18 @@
+# File: rag_project/config/settings.yaml
+
+pipeline:
+  data:
+    raw_directory: "../../data/raw/tutorials"
+    processed_directory: "../../data/processed"
+
+  chunker:
+    chunk_size: 512
+    overlap: 128
+
+  vector_store:
+    type: "Faiss"
+    vector_dim: 384
+
+  query:
+    text: "At a high-level, which steps are there at most graph chains?"
+    top_k: 3

@@ -1,0 +1,12 @@
+.env
+aggregated_code.txt
+parser.py
+test.py
+mypy.ini
+metadata.db
+.mypy_cache
+.pytest_cache
+.idea
+*.db
+/venv/
+__pycache__/

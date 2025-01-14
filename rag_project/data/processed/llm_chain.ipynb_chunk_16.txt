@@ -1,0 +1,1 @@
+er reading on the core concepts of LangChain weve got detailed Conceptual Guidesdocsconcepts If you have more specific questions on these concepts check out the following sections of the howto guides  Chat modelsdocshow_tochatmodels  Prompt templatesdocshow_toprompttemplates And the LangSmith docs  LangSmithhttpsdocssmithlangchaincom

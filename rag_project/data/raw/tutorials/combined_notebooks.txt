@@ -1,0 +1,4306 @@
+===== Notebook: extraction.ipynb =====
+---
+sidebar_position: 4
+---
+
+# Build an Extraction Chain
+
+In this tutorial, we will use [tool-calling](/docs/concepts/tool_calling) features of [chat models](/docs/concepts/chat_models) to extract structured information from unstructured text. We will also demonstrate how to use [few-shot prompting](/docs/concepts/few_shot_prompting/) in this context to improve performance.
+
+:::important
+This tutorial requires `langchain-core>=0.3.20` and will only work with models that support **tool calling**.
+:::
+
+## Setup
+
+### Jupyter Notebook
+
+This and other tutorials are perhaps most conveniently run in a [Jupyter notebooks](https://jupyter.org/). Going through guides in an interactive environment is a great way to better understand them. See [here](https://jupyter.org/install) for instructions on how to install.
+
+### Installation
+
+To install LangChain run:
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+import CodeBlock from "@theme/CodeBlock";
+
+<Tabs>
+  <TabItem value="pip" label="Pip" default>
+    <CodeBlock language="bash">pip install --upgrade langchain-core</CodeBlock>
+  </TabItem>
+  <TabItem value="conda" label="Conda">
+    <CodeBlock language="bash">conda install langchain-core -c conda-forge</CodeBlock>
+  </TabItem>
+</Tabs>
+
+
+
+For more details, see our [Installation guide](/docs/how_to/installation).
+
+### LangSmith
+
+Many of the applications you build with LangChain will contain multiple steps with multiple invocations of LLM calls.
+As these applications get more and more complex, it becomes crucial to be able to inspect what exactly is going on inside your chain or agent.
+The best way to do this is with [LangSmith](https://smith.langchain.com).
+
+After you sign up at the link above, make sure to set your environment variables to start logging traces:
+
+```shell
+export LANGCHAIN_TRACING_V2="true"
+export LANGCHAIN_API_KEY="..."
+```
+
+Or, if in a notebook, you can set them with:
+
+```python
+import getpass
+import os
+
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+os.environ["LANGCHAIN_API_KEY"] = getpass.getpass()
+```
+
+## The Schema
+
+First, we need to describe what information we want to extract from the text.
+
+We'll use Pydantic to define an example schema  to extract personal information.
+
+from typing import Optional
+
+from pydantic import BaseModel, Field
+
+
+class Person(BaseModel):
+    """Information about a person."""
+
+    # ^ Doc-string for the entity Person.
+    # This doc-string is sent to the LLM as the description of the schema Person,
+    # and it can help to improve extraction results.
+
+    # Note that:
+    # 1. Each field is an `optional` -- this allows the model to decline to extract it!
+    # 2. Each field has a `description` -- this description is used by the LLM.
+    # Having a good description can help improve extraction results.
+    name: Optional[str] = Field(default=None, description="The name of the person")
+    hair_color: Optional[str] = Field(
+        default=None, description="The color of the person's hair if known"
+    )
+    height_in_meters: Optional[str] = Field(
+        default=None, description="Height measured in meters"
+    )
+
+There are two best practices when defining schema:
+
+1. Document the **attributes** and the **schema** itself: This information is sent to the LLM and is used to improve the quality of information extraction.
+2. Do not force the LLM to make up information! Above we used `Optional` for the attributes allowing the LLM to output `None` if it doesn't know the answer.
+
+:::important
+For best performance, document the schema well and make sure the model isn't force to return results if there's no information to be extracted in the text.
+:::
+
+## The Extractor
+
+Let's create an information extractor using the schema we defined above.
+
+from typing import Optional
+
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from pydantic import BaseModel, Field
+
+# Define a custom prompt to provide instructions and any additional context.
+# 1) You can add examples into the prompt template to improve extraction quality
+# 2) Introduce additional parameters to take context into account (e.g., include metadata
+#    about the document from which the text was extracted.)
+prompt_template = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are an expert extraction algorithm. "
+            "Only extract relevant information from the text. "
+            "If you do not know the value of an attribute asked to extract, "
+            "return null for the attribute's value.",
+        ),
+        # Please see the how-to about improving performance with
+        # reference examples.
+        # MessagesPlaceholder('examples'),
+        ("human", "{text}"),
+    ]
+)
+
+We need to use a model that supports function/tool calling.
+
+Please review [the documentation](/docs/concepts/tool_calling) for all models that can be used with this API.
+
+import ChatModelTabs from "@theme/ChatModelTabs";
+
+<ChatModelTabs customVarName="llm" />
+
+# | output: false
+# | echo: false
+
+from langchain_openai import ChatOpenAI
+
+llm = ChatOpenAI(model="gpt-4o-mini")
+
+structured_llm = llm.with_structured_output(schema=Person)
+
+Let's test it out:
+
+text = "Alan Smith is 6 feet tall and has blond hair."
+prompt = prompt_template.invoke({"text": text})
+structured_llm.invoke(prompt)
+
+:::important 
+
+Extraction is Generative 🤯
+
+LLMs are generative models, so they can do some pretty cool things like correctly extract the height of the person in meters
+even though it was provided in feet!
+:::
+
+We can see the LangSmith trace [here](https://smith.langchain.com/public/44b69a63-3b3b-47b8-8a6d-61b46533f015/r). Note that the [chat model portion of the trace](https://smith.langchain.com/public/44b69a63-3b3b-47b8-8a6d-61b46533f015/r/dd1f6305-f1e9-4919-bd8f-339d03a12d01) reveals the exact sequence of messages sent to the model, tools invoked, and other metadata.
+
+## Multiple Entities
+
+In **most cases**, you should be extracting a list of entities rather than a single entity.
+
+This can be easily achieved using pydantic by nesting models inside one another.
+
+from typing import List, Optional
+
+from pydantic import BaseModel, Field
+
+
+class Person(BaseModel):
+    """Information about a person."""
+
+    # ^ Doc-string for the entity Person.
+    # This doc-string is sent to the LLM as the description of the schema Person,
+    # and it can help to improve extraction results.
+
+    # Note that:
+    # 1. Each field is an `optional` -- this allows the model to decline to extract it!
+    # 2. Each field has a `description` -- this description is used by the LLM.
+    # Having a good description can help improve extraction results.
+    name: Optional[str] = Field(default=None, description="The name of the person")
+    hair_color: Optional[str] = Field(
+        default=None, description="The color of the person's hair if known"
+    )
+    height_in_meters: Optional[str] = Field(
+        default=None, description="Height measured in meters"
+    )
+
+
+class Data(BaseModel):
+    """Extracted data about people."""
+
+    # Creates a model so that we can extract multiple entities.
+    people: List[Person]
+
+:::important
+Extraction results might not be perfect here. Read on to see how to use **Reference Examples** to improve the quality of extraction, and check out our extraction [how-to](/docs/how_to/#extraction) guides for more detail.
+:::
+
+structured_llm = llm.with_structured_output(schema=Data)
+text = "My name is Jeff, my hair is black and i am 6 feet tall. Anna has the same color hair as me."
+prompt = prompt_template.invoke({"text": text})
+structured_llm.invoke(prompt)
+
+:::tip
+When the schema accommodates the extraction of **multiple entities**, it also allows the model to extract **no entities** if no relevant information
+is in the text by providing an empty list. 
+
+This is usually a **good** thing! It allows specifying **required** attributes on an entity without necessarily forcing the model to detect this entity.
+:::
+
+We can see the LangSmith trace [here](https://smith.langchain.com/public/7173764d-5e76-45fe-8496-84460bd9cdef/r).
+
+## Reference examples
+
+The behavior of LLM applications can be steered using [few-shot prompting](/docs/concepts/few_shot_prompting/). For [chat models](/docs/concepts/chat_models/), this can take the form of a sequence of pairs of input and response messages demonstrating desired behaviors.
+
+For example, we can convey the meaning of a symbol with alternating `user` and `assistant` [messages](/docs/concepts/messages/#role):
+
+messages = [
+    {"role": "user", "content": "2 🦜 2"},
+    {"role": "assistant", "content": "4"},
+    {"role": "user", "content": "2 🦜 3"},
+    {"role": "assistant", "content": "5"},
+    {"role": "user", "content": "3 🦜 4"},
+]
+
+response = llm.invoke(messages)
+print(response.content)
+
+[Structured output](/docs/concepts/structured_outputs/) often uses [tool calling](/docs/concepts/tool_calling/) under-the-hood. This typically involves the generation of [AI messages](/docs/concepts/messages/#aimessage) containing tool calls, as well as [tool messages](/docs/concepts/messages/#toolmessage) containing the results of tool calls. What should a sequence of messages look like in this case?
+
+Different [chat model providers](/docs/integrations/chat/) impose different requirements for valid message sequences. Some will accept a (repeating) message sequence of the form:
+
+- User message
+- AI message with tool call
+- Tool message with result
+
+Others require a final AI message containing some sort of response.
+
+LangChain includes a utility function [tool_example_to_messages](https://python.langchain.com/api_reference/core/utils/langchain_core.utils.function_calling.tool_example_to_messages.html) that will generate a valid sequence for most model providers. It simplifies the generation of structured few-shot examples by just requiring Pydantic representations of the corresponding tool calls.
+
+Let's try this out. We can convert pairs of input strings and desired Pydantic objects to a sequence of messages that can be provided to a chat model. Under the hood, LangChain will format the tool calls to each provider's required format.
+
+Note: this version of `tool_example_to_messages` requires `langchain-core>=0.3.20`.
+
+from langchain_core.utils.function_calling import tool_example_to_messages
+
+examples = [
+    (
+        "The ocean is vast and blue. It's more than 20,000 feet deep.",
+        Data(people=[]),
+    ),
+    (
+        "Fiona traveled far from France to Spain.",
+        Data(people=[Person(name="Fiona", height_in_meters=None, hair_color=None)]),
+    ),
+]
+
+
+messages = []
+
+for txt, tool_call in examples:
+    if tool_call.people:
+        # This final message is optional for some providers
+        ai_response = "Detected people."
+    else:
+        ai_response = "Detected no people."
+    messages.extend(tool_example_to_messages(txt, [tool_call], ai_response=ai_response))
+
+Inspecting the result, we see these two example pairs generated eight messages:
+
+for message in messages:
+    message.pretty_print()
+
+Let's compare performance with and without these messages. For example, let's pass a message for which we intend no people to be extracted:
+
+message_no_extraction = {
+    "role": "user",
+    "content": "The solar system is large, but earth has only 1 moon.",
+}
+
+structured_llm = llm.with_structured_output(schema=Data)
+structured_llm.invoke([message_no_extraction])
+
+In this example, the model is liable to erroneously generate records of people.
+
+Because our few-shot examples contain examples of "negatives", we encourage the model to behave correctly in this case:
+
+structured_llm.invoke(messages + [message_no_extraction])
+
+:::tip
+
+The [LangSmith](https://smith.langchain.com/public/b3433f57-7905-4430-923c-fed214525bf1/r) trace for the run reveals the exact sequence of messages sent to the chat model, tool calls generated, latency, token counts, and other metadata.
+
+:::
+
+See [this guide](/docs/how_to/extraction_examples/) for more detail on extraction workflows with reference examples, including how to incorporate prompt templates and customize the generation of example messages.
+
+## Next steps
+
+Now that you understand the basics of extraction with LangChain, you're ready to proceed to the rest of the how-to guides:
+
+- [Add Examples](/docs/how_to/extraction_examples): More detail on using **reference examples** to improve performance.
+- [Handle Long Text](/docs/how_to/extraction_long_text): What should you do if the text does not fit into the context window of the LLM?
+- [Use a Parsing Approach](/docs/how_to/extraction_parse): Use a prompt based approach to extract with models that do not support **tool/function calling**.
+
+
+
+===== Notebook: graph.ipynb =====
+---
+sidebar_position: 0
+---
+
+# Build a Question Answering application over a Graph Database
+
+In this guide we'll go over the basic ways to create a Q&A chain over a graph database. These systems will allow us to ask a question about the data in a graph database and get back a natural language answer. First, we will show a simple out-of-the-box option and then implement a more sophisticated version with LangGraph.
+
+## ⚠️ Security note ⚠️
+
+Building Q&A systems of graph databases requires executing model-generated graph queries. There are inherent risks in doing this. Make sure that your database connection permissions are always scoped as narrowly as possible for your chain/agent's needs. This will mitigate though not eliminate the risks of building a model-driven system. For more on general security best practices, [see here](/docs/security).
+
+
+## Architecture
+
+At a high-level, the steps of most graph chains are:
+
+1. **Convert question to a graph database query**: Model converts user input to a graph database query (e.g. Cypher).
+2. **Execute graph database query**: Execute the graph database query.
+3. **Answer the question**: Model responds to user input using the query results.
+
+
+![sql_usecase.png](../../static/img/graph_usecase.png)
+
+## Setup
+
+First, get required packages and set environment variables.
+In this example, we will be using Neo4j graph database.
+
+%pip install --upgrade --quiet langchain langchain-neo4j langchain-openai langgraph
+
+We default to OpenAI models in this guide.
+
+import getpass
+import os
+
+if "OPENAI_API_KEY" not in os.environ:
+    os.environ["OPENAI_API_KEY"] = getpass.getpass("Enter your OpenAI API key: ")
+
+# Uncomment the below to use LangSmith. Not required.
+# os.environ["LANGCHAIN_API_KEY"] = getpass.getpass()
+# os.environ["LANGCHAIN_TRACING_V2"] = "true"
+
+Next, we need to define Neo4j credentials.
+Follow [these installation steps](https://neo4j.com/docs/operations-manual/current/installation/) to set up a Neo4j database.
+
+os.environ["NEO4J_URI"] = "bolt://localhost:7687"
+os.environ["NEO4J_USERNAME"] = "neo4j"
+os.environ["NEO4J_PASSWORD"] = "password"
+
+The below example will create a connection with a Neo4j database and will populate it with example data about movies and their actors.
+
+from langchain_neo4j import Neo4jGraph
+
+graph = Neo4jGraph()
+
+# Import movie information
+
+movies_query = """
+LOAD CSV WITH HEADERS FROM 
+'https://raw.githubusercontent.com/tomasonjo/blog-datasets/main/movies/movies_small.csv'
+AS row
+MERGE (m:Movie {id:row.movieId})
+SET m.released = date(row.released),
+    m.title = row.title,
+    m.imdbRating = toFloat(row.imdbRating)
+FOREACH (director in split(row.director, '|') | 
+    MERGE (p:Person {name:trim(director)})
+    MERGE (p)-[:DIRECTED]->(m))
+FOREACH (actor in split(row.actors, '|') | 
+    MERGE (p:Person {name:trim(actor)})
+    MERGE (p)-[:ACTED_IN]->(m))
+FOREACH (genre in split(row.genres, '|') | 
+    MERGE (g:Genre {name:trim(genre)})
+    MERGE (m)-[:IN_GENRE]->(g))
+"""
+
+graph.query(movies_query)
+
+## Graph schema
+
+In order for an LLM to be able to generate a Cypher statement, it needs information about the graph schema. When you instantiate a graph object, it retrieves the information about the graph schema. If you later make any changes to the graph, you can run the `refresh_schema` method to refresh the schema information.
+
+graph.refresh_schema()
+print(graph.schema)
+
+For more involved schema information, you can use `enhanced_schema` option.
+
+enhanced_graph = Neo4jGraph(enhanced_schema=True)
+print(enhanced_graph.schema)
+
+The `enhanced_schema` option enriches property information by including details such as minimum and maximum values for floats and dates, as well as example values for string properties. This additional context helps guide the LLM toward generating more accurate and effective queries.
+
+Great! We've got a graph database that we can query. Now let's try hooking it up to an LLM.
+
+## GraphQACypherChain
+
+Let's use a simple out-of-the-box chain that takes a question, turns it into a Cypher query, executes the query, and uses the result to answer the original question.
+
+![graph_chain.webp](../../static/img/graph_chain.webp)
+
+
+LangChain comes with a built-in chain for this workflow that is designed to work with Neo4j: [GraphCypherQAChain](/docs/integrations/graphs/neo4j_cypher)
+
+from langchain_neo4j import GraphCypherQAChain
+from langchain_openai import ChatOpenAI
+
+llm = ChatOpenAI(model="gpt-4o", temperature=0)
+chain = GraphCypherQAChain.from_llm(
+    graph=enhanced_graph, llm=llm, verbose=True, allow_dangerous_requests=True
+)
+response = chain.invoke({"query": "What was the cast of the Casino?"})
+response
+
+## Advanced implementation with LangGraph
+
+While the GraphCypherQAChain is effective for quick demonstrations, it may face challenges in production environments. Transitioning to LangGraph can enhance the workflow, but implementing natural language to query flows in production remains a complex task. Nevertheless, there are several strategies to significantly improve accuracy and reliability, which we will explore next.
+
+Here is the visualized LangGraph flow we will implement:
+
+![langgraph_text2cypher](../../static/img/langgraph_text2cypher.webp)
+
+
+We will begin by defining the Input, Output, and Overall state of the LangGraph application.
+
+from operator import add
+from typing import Annotated, List
+
+from typing_extensions import TypedDict
+
+
+class InputState(TypedDict):
+    question: str
+
+
+class OverallState(TypedDict):
+    question: str
+    next_action: str
+    cypher_statement: str
+    cypher_errors: List[str]
+    database_records: List[dict]
+    steps: Annotated[List[str], add]
+
+
+class OutputState(TypedDict):
+    answer: str
+    steps: List[str]
+    cypher_statement: str
+
+The first step is a simple `guardrails` step, where we validate whether the question pertains to movies or their cast. If it doesn't, we notify the user that we cannot answer any other questions. Otherwise, we move on to the Cypher generation step.
+
+from typing import Literal
+
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel, Field
+
+guardrails_system = """
+As an intelligent assistant, your primary objective is to decide whether a given question is related to movies or not. 
+If the question is related to movies, output "movie". Otherwise, output "end".
+To make this decision, assess the content of the question and determine if it refers to any movie, actor, director, film industry, 
+or related topics. Provide only the specified output: "movie" or "end".
+"""
+guardrails_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            guardrails_system,
+        ),
+        (
+            "human",
+            ("{question}"),
+        ),
+    ]
+)
+
+
+class GuardrailsOutput(BaseModel):
+    decision: Literal["movie", "end"] = Field(
+        description="Decision on whether the question is related to movies"
+    )
+
+
+guardrails_chain = guardrails_prompt | llm.with_structured_output(GuardrailsOutput)
+
+
+def guardrails(state: InputState) -> OverallState:
+    """
+    Decides if the question is related to movies or not.
+    """
+    guardrails_output = guardrails_chain.invoke({"question": state.get("question")})
+    database_records = None
+    if guardrails_output.decision == "end":
+        database_records = "This questions is not about movies or their cast. Therefore I cannot answer this question."
+    return {
+        "next_action": guardrails_output.decision,
+        "database_records": database_records,
+        "steps": ["guardrail"],
+    }
+
+### Few-shot prompting
+
+Converting natural language into accurate queries is challenging. One way to enhance this process is by providing relevant few-shot examples to guide the LLM in query generation. To achieve this, we will use the `SemanticSimilarityExampleSelector` to dynamically select the most relevant examples.
+
+from langchain_core.example_selectors import SemanticSimilarityExampleSelector
+from langchain_neo4j import Neo4jVector
+from langchain_openai import OpenAIEmbeddings
+
+examples = [
+    {
+        "question": "How many artists are there?",
+        "query": "MATCH (a:Person)-[:ACTED_IN]->(:Movie) RETURN count(DISTINCT a)",
+    },
+    {
+        "question": "Which actors played in the movie Casino?",
+        "query": "MATCH (m:Movie {title: 'Casino'})<-[:ACTED_IN]-(a) RETURN a.name",
+    },
+    {
+        "question": "How many movies has Tom Hanks acted in?",
+        "query": "MATCH (a:Person {name: 'Tom Hanks'})-[:ACTED_IN]->(m:Movie) RETURN count(m)",
+    },
+    {
+        "question": "List all the genres of the movie Schindler's List",
+        "query": "MATCH (m:Movie {title: 'Schindler's List'})-[:IN_GENRE]->(g:Genre) RETURN g.name",
+    },
+    {
+        "question": "Which actors have worked in movies from both the comedy and action genres?",
+        "query": "MATCH (a:Person)-[:ACTED_IN]->(:Movie)-[:IN_GENRE]->(g1:Genre), (a)-[:ACTED_IN]->(:Movie)-[:IN_GENRE]->(g2:Genre) WHERE g1.name = 'Comedy' AND g2.name = 'Action' RETURN DISTINCT a.name",
+    },
+    {
+        "question": "Which directors have made movies with at least three different actors named 'John'?",
+        "query": "MATCH (d:Person)-[:DIRECTED]->(m:Movie)<-[:ACTED_IN]-(a:Person) WHERE a.name STARTS WITH 'John' WITH d, COUNT(DISTINCT a) AS JohnsCount WHERE JohnsCount >= 3 RETURN d.name",
+    },
+    {
+        "question": "Identify movies where directors also played a role in the film.",
+        "query": "MATCH (p:Person)-[:DIRECTED]->(m:Movie), (p)-[:ACTED_IN]->(m) RETURN m.title, p.name",
+    },
+    {
+        "question": "Find the actor with the highest number of movies in the database.",
+        "query": "MATCH (a:Actor)-[:ACTED_IN]->(m:Movie) RETURN a.name, COUNT(m) AS movieCount ORDER BY movieCount DESC LIMIT 1",
+    },
+]
+
+example_selector = SemanticSimilarityExampleSelector.from_examples(
+    examples, OpenAIEmbeddings(), Neo4jVector, k=5, input_keys=["question"]
+)
+
+Next, we implement the Cypher generation chain, also known as **text2cypher**. The prompt includes an enhanced graph schema, dynamically selected few-shot examples, and the user’s question. This combination enables the generation of a Cypher query to retrieve relevant information from the database.
+
+from langchain_core.output_parsers import StrOutputParser
+
+text2cypher_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            (
+                "Given an input question, convert it to a Cypher query. No pre-amble."
+                "Do not wrap the response in any backticks or anything else. Respond with a Cypher statement only!"
+            ),
+        ),
+        (
+            "human",
+            (
+                """You are a Neo4j expert. Given an input question, create a syntactically correct Cypher query to run.
+Do not wrap the response in any backticks or anything else. Respond with a Cypher statement only!
+Here is the schema information
+{schema}
+
+Below are a number of examples of questions and their corresponding Cypher queries.
+
+{fewshot_examples}
+
+User input: {question}
+Cypher query:"""
+            ),
+        ),
+    ]
+)
+
+text2cypher_chain = text2cypher_prompt | llm | StrOutputParser()
+
+
+def generate_cypher(state: OverallState) -> OverallState:
+    """
+    Generates a cypher statement based on the provided schema and user input
+    """
+    NL = "\n"
+    fewshot_examples = (NL * 2).join(
+        [
+            f"Question: {el['question']}{NL}Cypher:{el['query']}"
+            for el in example_selector.select_examples(
+                {"question": state.get("question")}
+            )
+        ]
+    )
+    generated_cypher = text2cypher_chain.invoke(
+        {
+            "question": state.get("question"),
+            "fewshot_examples": fewshot_examples,
+            "schema": enhanced_graph.schema,
+        }
+    )
+    return {"cypher_statement": generated_cypher, "steps": ["generate_cypher"]}
+
+### Query validation
+
+The next step is to validate the generated Cypher statement and ensuring that all property values are accurate. While numbers and dates typically don’t require validation, strings such as movie titles or people’s names do. In this example, we’ll use a basic `CONTAINS` clause for validation, though more advanced mapping and validation techniques can be implemented if needed.
+
+First, we will create a chain that detects any errors in the Cypher statement and extracts the property values it references.
+
+from typing import List, Optional
+
+validate_cypher_system = """
+You are a Cypher expert reviewing a statement written by a junior developer.
+"""
+
+validate_cypher_user = """You must check the following:
+* Are there any syntax errors in the Cypher statement?
+* Are there any missing or undefined variables in the Cypher statement?
+* Are any node labels missing from the schema?
+* Are any relationship types missing from the schema?
+* Are any of the properties not included in the schema?
+* Does the Cypher statement include enough information to answer the question?
+
+Examples of good errors:
+* Label (:Foo) does not exist, did you mean (:Bar)?
+* Property bar does not exist for label Foo, did you mean baz?
+* Relationship FOO does not exist, did you mean FOO_BAR?
+
+Schema:
+{schema}
+
+The question is:
+{question}
+
+The Cypher statement is:
+{cypher}
+
+Make sure you don't make any mistakes!"""
+
+validate_cypher_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            validate_cypher_system,
+        ),
+        (
+            "human",
+            (validate_cypher_user),
+        ),
+    ]
+)
+
+
+class Property(BaseModel):
+    """
+    Represents a filter condition based on a specific node property in a graph in a Cypher statement.
+    """
+
+    node_label: str = Field(
+        description="The label of the node to which this property belongs."
+    )
+    property_key: str = Field(description="The key of the property being filtered.")
+    property_value: str = Field(
+        description="The value that the property is being matched against."
+    )
+
+
+class ValidateCypherOutput(BaseModel):
+    """
+    Represents the validation result of a Cypher query's output,
+    including any errors and applied filters.
+    """
+
+    errors: Optional[List[str]] = Field(
+        description="A list of syntax or semantical errors in the Cypher statement. Always explain the discrepancy between schema and Cypher statement"
+    )
+    filters: Optional[List[Property]] = Field(
+        description="A list of property-based filters applied in the Cypher statement."
+    )
+
+
+validate_cypher_chain = validate_cypher_prompt | llm.with_structured_output(
+    ValidateCypherOutput
+)
+
+LLMs often struggle with correctly determining relationship directions in generated Cypher statements. Since we have access to the schema, we can deterministically correct these directions using the **CypherQueryCorrector**. 
+
+*Note: The `CypherQueryCorrector` is an experimental feature and doesn't support all the newest Cypher syntax.*
+
+from langchain_neo4j.chains.graph_qa.cypher_utils import CypherQueryCorrector, Schema
+
+# Cypher query corrector is experimental
+corrector_schema = [
+    Schema(el["start"], el["type"], el["end"])
+    for el in enhanced_graph.structured_schema.get("relationships")
+]
+cypher_query_corrector = CypherQueryCorrector(corrector_schema)
+
+Now we can implement the Cypher validation step. First, we use the `EXPLAIN` method to detect any syntax errors. Next, we leverage the LLM to identify potential issues and extract the properties used for filtering. For string properties, we validate them against the database using a simple `CONTAINS` clause.
+
+Based on the validation results, the process can take the following paths:
+
+- If value mapping fails, we end the conversation and inform the user that we couldn't identify a specific property value (e.g., a person or movie title).  
+- If errors are found, we route the query for correction.  
+- If no issues are detected, we proceed to the Cypher execution step.  
+
+from neo4j.exceptions import CypherSyntaxError
+
+
+def validate_cypher(state: OverallState) -> OverallState:
+    """
+    Validates the Cypher statements and maps any property values to the database.
+    """
+    errors = []
+    mapping_errors = []
+    # Check for syntax errors
+    try:
+        enhanced_graph.query(f"EXPLAIN {state.get('cypher_statement')}")
+    except CypherSyntaxError as e:
+        errors.append(e.message)
+    # Experimental feature for correcting relationship directions
+    corrected_cypher = cypher_query_corrector(state.get("cypher_statement"))
+    if not corrected_cypher:
+        errors.append("The generated Cypher statement doesn't fit the graph schema")
+    if not corrected_cypher == state.get("cypher_statement"):
+        print("Relationship direction was corrected")
+    # Use LLM to find additional potential errors and get the mapping for values
+    llm_output = validate_cypher_chain.invoke(
+        {
+            "question": state.get("question"),
+            "schema": enhanced_graph.schema,
+            "cypher": state.get("cypher_statement"),
+        }
+    )
+    if llm_output.errors:
+        errors.extend(llm_output.errors)
+    if llm_output.filters:
+        for filter in llm_output.filters:
+            # Do mapping only for string values
+            if (
+                not [
+                    prop
+                    for prop in enhanced_graph.structured_schema["node_props"][
+                        filter.node_label
+                    ]
+                    if prop["property"] == filter.property_key
+                ][0]["type"]
+                == "STRING"
+            ):
+                continue
+            mapping = enhanced_graph.query(
+                f"MATCH (n:{filter.node_label}) WHERE toLower(n.`{filter.property_key}`) = toLower($value) RETURN 'yes' LIMIT 1",
+                {"value": filter.property_value},
+            )
+            if not mapping:
+                print(
+                    f"Missing value mapping for {filter.node_label} on property {filter.property_key} with value {filter.property_value}"
+                )
+                mapping_errors.append(
+                    f"Missing value mapping for {filter.node_label} on property {filter.property_key} with value {filter.property_value}"
+                )
+    if mapping_errors:
+        next_action = "end"
+    elif errors:
+        next_action = "correct_cypher"
+    else:
+        next_action = "execute_cypher"
+
+    return {
+        "next_action": next_action,
+        "cypher_statement": corrected_cypher,
+        "cypher_errors": errors,
+        "steps": ["validate_cypher"],
+    }
+
+The Cypher correction step takes the existing Cypher statement, any identified errors, and the original question to generate a corrected version of the query.
+
+correct_cypher_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            (
+                "You are a Cypher expert reviewing a statement written by a junior developer. "
+                "You need to correct the Cypher statement based on the provided errors. No pre-amble."
+                "Do not wrap the response in any backticks or anything else. Respond with a Cypher statement only!"
+            ),
+        ),
+        (
+            "human",
+            (
+                """Check for invalid syntax or semantics and return a corrected Cypher statement.
+
+Schema:
+{schema}
+
+Note: Do not include any explanations or apologies in your responses.
+Do not wrap the response in any backticks or anything else.
+Respond with a Cypher statement only!
+
+Do not respond to any questions that might ask anything else than for you to construct a Cypher statement.
+
+The question is:
+{question}
+
+The Cypher statement is:
+{cypher}
+
+The errors are:
+{errors}
+
+Corrected Cypher statement: """
+            ),
+        ),
+    ]
+)
+
+correct_cypher_chain = correct_cypher_prompt | llm | StrOutputParser()
+
+
+def correct_cypher(state: OverallState) -> OverallState:
+    """
+    Correct the Cypher statement based on the provided errors.
+    """
+    corrected_cypher = correct_cypher_chain.invoke(
+        {
+            "question": state.get("question"),
+            "errors": state.get("cypher_errors"),
+            "cypher": state.get("cypher_statement"),
+            "schema": enhanced_graph.schema,
+        }
+    )
+
+    return {
+        "next_action": "validate_cypher",
+        "cypher_statement": corrected_cypher,
+        "steps": ["correct_cypher"],
+    }
+
+We need to add a step that executes the given Cypher statement. If no results are returned, we should explicitly handle this scenario, as leaving the context empty can sometimes lead to LLM hallucinations.
+
+no_results = "I couldn't find any relevant information in the database"
+
+
+def execute_cypher(state: OverallState) -> OverallState:
+    """
+    Executes the given Cypher statement.
+    """
+
+    records = enhanced_graph.query(state.get("cypher_statement"))
+    return {
+        "database_records": records if records else no_results,
+        "next_action": "end",
+        "steps": ["execute_cypher"],
+    }
+
+The final step is to generate the answer. This involves combining the initial question with the database output to produce a relevant response.
+
+generate_final_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are a helpful assistant",
+        ),
+        (
+            "human",
+            (
+                """Use the following results retrieved from a database to provide
+a succinct, definitive answer to the user's question.
+
+Respond as if you are answering the question directly.
+
+Results: {results}
+Question: {question}"""
+            ),
+        ),
+    ]
+)
+
+generate_final_chain = generate_final_prompt | llm | StrOutputParser()
+
+
+def generate_final_answer(state: OverallState) -> OutputState:
+    """
+    Decides if the question is related to movies.
+    """
+    final_answer = generate_final_chain.invoke(
+        {"question": state.get("question"), "results": state.get("database_records")}
+    )
+    return {"answer": final_answer, "steps": ["generate_final_answer"]}
+
+Next, we will implement the LangGraph workflow, starting with defining the conditional edge functions.
+
+def guardrails_condition(
+    state: OverallState,
+) -> Literal["generate_cypher", "generate_final_answer"]:
+    if state.get("next_action") == "end":
+        return "generate_final_answer"
+    elif state.get("next_action") == "movie":
+        return "generate_cypher"
+
+
+def validate_cypher_condition(
+    state: OverallState,
+) -> Literal["generate_final_answer", "correct_cypher", "execute_cypher"]:
+    if state.get("next_action") == "end":
+        return "generate_final_answer"
+    elif state.get("next_action") == "correct_cypher":
+        return "correct_cypher"
+    elif state.get("next_action") == "execute_cypher":
+        return "execute_cypher"
+
+Let's put it all together now.
+
+from IPython.display import Image, display
+from langgraph.graph import END, START, StateGraph
+
+langgraph = StateGraph(OverallState, input=InputState, output=OutputState)
+langgraph.add_node(guardrails)
+langgraph.add_node(generate_cypher)
+langgraph.add_node(validate_cypher)
+langgraph.add_node(correct_cypher)
+langgraph.add_node(execute_cypher)
+langgraph.add_node(generate_final_answer)
+
+langgraph.add_edge(START, "guardrails")
+langgraph.add_conditional_edges(
+    "guardrails",
+    guardrails_condition,
+)
+langgraph.add_edge("generate_cypher", "validate_cypher")
+langgraph.add_conditional_edges(
+    "validate_cypher",
+    validate_cypher_condition,
+)
+langgraph.add_edge("execute_cypher", "generate_final_answer")
+langgraph.add_edge("correct_cypher", "validate_cypher")
+langgraph.add_edge("generate_final_answer", END)
+
+langgraph = langgraph.compile()
+
+# View
+display(Image(langgraph.get_graph().draw_mermaid_png()))
+
+We can now test the application by asking an irrelevant question.
+
+langgraph.invoke({"question": "What's the weather in Spain?"})
+
+Let's now ask something relevant about the movies.
+
+langgraph.invoke({"question": "What was the cast of the Casino?"})
+
+### Next steps
+
+For other graph techniques like this and more check out:
+
+* [Semantic layer](/docs/how_to/graph_semantic): Techniques for implementing semantic layers.
+* [Constructing graphs](/docs/how_to/graph_constructing): Techniques for constructing knowledge graphs.
+
+
+
+===== Notebook: llm_chain.ipynb =====
+---
+sidebar_position: 0
+---
+
+# Build a simple LLM application with chat models and prompt templates
+
+In this quickstart we'll show you how to build a simple LLM application with LangChain. This application will translate text from English into another language. This is a relatively simple LLM application - it's just a single LLM call plus some prompting. Still, this is a great way to get started with LangChain - a lot of features can be built with just some prompting and an LLM call!
+
+After reading this tutorial, you'll have a high level overview of:
+
+- Using [language models](/docs/concepts/chat_models)
+
+- Using [prompt templates](/docs/concepts/prompt_templates)
+
+- Debugging and tracing your application using [LangSmith](https://docs.smith.langchain.com/)
+
+Let's dive in!
+
+## Setup
+
+### Jupyter Notebook
+
+This and other tutorials are perhaps most conveniently run in a [Jupyter notebooks](https://jupyter.org/). Going through guides in an interactive environment is a great way to better understand them. See [here](https://jupyter.org/install) for instructions on how to install.
+
+### Installation
+
+To install LangChain run:
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+import CodeBlock from "@theme/CodeBlock";
+
+<Tabs>
+  <TabItem value="pip" label="Pip" default>
+    <CodeBlock language="bash">pip install langchain</CodeBlock>
+  </TabItem>
+  <TabItem value="conda" label="Conda">
+    <CodeBlock language="bash">conda install langchain -c conda-forge</CodeBlock>
+  </TabItem>
+</Tabs>
+
+
+
+For more details, see our [Installation guide](/docs/how_to/installation).
+
+### LangSmith
+
+Many of the applications you build with LangChain will contain multiple steps with multiple invocations of LLM calls.
+As these applications get more and more complex, it becomes crucial to be able to inspect what exactly is going on inside your chain or agent.
+The best way to do this is with [LangSmith](https://smith.langchain.com).
+
+After you sign up at the link above, make sure to set your environment variables to start logging traces:
+
+```shell
+export LANGCHAIN_TRACING_V2="true"
+export LANGCHAIN_API_KEY="..."
+```
+
+Or, if in a notebook, you can set them with:
+
+```python
+import getpass
+import os
+
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+os.environ["LANGCHAIN_API_KEY"] = getpass.getpass()
+```
+
+## Using Language Models
+
+First up, let's learn how to use a language model by itself. LangChain supports many different language models that you can use interchangeably. For details on getting started with a specific model, refer to [supported integrations](/docs/integrations/chat/).
+
+import ChatModelTabs from "@theme/ChatModelTabs";
+
+<ChatModelTabs openaiParams={`model="gpt-4o-mini"`} />
+
+
+# | output: false
+# | echo: false
+
+from langchain_openai import ChatOpenAI
+
+model = ChatOpenAI(model="gpt-4o-mini")
+
+Let's first use the model directly. [ChatModels](/docs/concepts/chat_models) are instances of LangChain [Runnables](/docs/concepts/runnables/), which means they expose a standard interface for interacting with them. To simply call the model, we can pass in a list of [messages](/docs/concepts/messages/) to the `.invoke` method.
+
+from langchain_core.messages import HumanMessage, SystemMessage
+
+messages = [
+    SystemMessage("Translate the following from English into Italian"),
+    HumanMessage("hi!"),
+]
+
+model.invoke(messages)
+
+:::tip
+
+If we've enabled LangSmith, we can see that this run is logged to LangSmith, and can see the [LangSmith trace](https://smith.langchain.com/public/88baa0b2-7c1a-4d09-ba30-a47985dde2ea/r). The LangSmith trace reports [token](/docs/concepts/tokens/) usage information, latency, [standard model parameters](/docs/concepts/chat_models/#standard-parameters) (such as temperature), and other information.
+
+:::
+
+Note that ChatModels receive [message](/docs/concepts/messages/) objects as input and generate message objects as output. In addition to text content, message objects convey conversational [roles](/docs/concepts/messages/#role) and hold important data, such as [tool calls](/docs/concepts/tool_calling/) and token usage counts.
+
+LangChain also supports chat model inputs via strings or [OpenAI format](/docs/concepts/messages/#openai-format). The following are equivalent:
+
+```python
+model.invoke("Hello")
+
+model.invoke([{"role": "user", "content": "Hello"}])
+
+model.invoke([HumanMessage("Hello")])
+```
+
+### Streaming
+
+Because chat models are [Runnables](/docs/concepts/runnables/), they expose a standard interface that includes async and streaming modes of invocation. This allows us to stream individual tokens from a chat model:
+
+for token in model.stream(messages):
+    print(token.content, end="|")
+
+You can find more details on streaming chat model outputs in [this guide](/docs/how_to/chat_streaming/).
+
+## Prompt Templates
+
+Right now we are passing a list of messages directly into the language model. Where does this list of messages come from? Usually, it is constructed from a combination of user input and application logic. This application logic usually takes the raw user input and transforms it into a list of messages ready to pass to the language model. Common transformations include adding a system message or formatting a template with the user input.
+
+[Prompt templates](/docs/concepts/prompt_templates/) are a concept in LangChain designed to assist with this transformation. They take in raw user input and return data (a prompt) that is ready to pass into a language model. 
+
+Let's create a prompt template here. It will take in two user variables:
+
+- `language`: The language to translate text into
+- `text`: The text to translate
+
+from langchain_core.prompts import ChatPromptTemplate
+
+system_template = "Translate the following from English into {language}"
+
+prompt_template = ChatPromptTemplate.from_messages(
+    [("system", system_template), ("user", "{text}")]
+)
+
+Note that `ChatPromptTemplate` supports multiple [message roles](/docs/concepts/messages/#role) in a single template. We format the `language` parameter into the system message, and the user `text` into a user message.
+
+The input to this prompt template is a dictionary. We can play around with this prompt template by itself to see what it does by itself
+
+prompt = prompt_template.invoke({"language": "Italian", "text": "hi!"})
+
+prompt
+
+We can see that it returns a `ChatPromptValue` that consists of two messages. If we want to access the messages directly we do:
+
+prompt.to_messages()
+
+Finally, we can invoke the chat model on the formatted prompt:
+
+response = model.invoke(prompt)
+print(response.content)
+
+:::tip
+Message `content` can contain both text and [content blocks](/docs/concepts/messages/#aimessage) with additional structure. See [this guide](/docs/how_to/output_parser_string/) for more information.
+:::
+
+If we take a look at the [LangSmith trace](https://smith.langchain.com/public/3ccc2d5e-2869-467b-95d6-33a577df99a2/r), we can see exactly what prompt the chat model receives, along with [token](/docs/concepts/tokens/) usage information, latency, [standard model parameters](/docs/concepts/chat_models/#standard-parameters) (such as temperature), and other information.
+
+## Conclusion
+
+That's it! In this tutorial you've learned how to create your first simple LLM application. You've learned how to work with language models, how to create a prompt template, and how to get great observability into applications you create with LangSmith.
+
+This just scratches the surface of what you will want to learn to become a proficient AI Engineer. Luckily - we've got a lot of other resources!
+
+For further reading on the core concepts of LangChain, we've got detailed [Conceptual Guides](/docs/concepts).
+
+If you have more specific questions on these concepts, check out the following sections of the how-to guides:
+
+- [Chat models](/docs/how_to/#chat-models)
+- [Prompt templates](/docs/how_to/#prompt-templates)
+
+And the LangSmith docs:
+
+- [LangSmith](https://docs.smith.langchain.com)
+
+===== Notebook: agents.ipynb =====
+---
+keywords: [agent, agents]
+---
+
+# Build an Agent
+
+By themselves, language models can't take actions - they just output text.
+A big use case for LangChain is creating **agents**.
+[Agents](/docs/concepts/agents) are systems that use [LLMs](/docs/concepts/chat_models) as reasoning engines to determine which actions to take and the inputs necessary to perform the action.
+After executing actions, the results can be fed back into the LLM to determine whether more actions are needed, or whether it is okay to finish. This is often achieved via [tool-calling](/docs/concepts/tool_calling).
+
+In this tutorial we will build an agent that can interact with a search engine. You will be able to ask this agent questions, watch it call the search tool, and have conversations with it.
+
+## End-to-end agent
+
+The code snippet below represents a fully functional agent that uses an LLM to decide which tools to use. It is equipped with a generic search tool. It has conversational memory - meaning that it can be used as a multi-turn chatbot.
+
+In the rest of the guide, we will walk through the individual components and what each part does - but if you want to just grab some code and get started, feel free to use this!
+
+# Import relevant functionality
+from langchain_anthropic import ChatAnthropic
+from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_core.messages import HumanMessage
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.prebuilt import create_react_agent
+
+# Create the agent
+memory = MemorySaver()
+model = ChatAnthropic(model_name="claude-3-sonnet-20240229")
+search = TavilySearchResults(max_results=2)
+tools = [search]
+agent_executor = create_react_agent(model, tools, checkpointer=memory)
+
+# Use the agent
+config = {"configurable": {"thread_id": "abc123"}}
+for chunk in agent_executor.stream(
+    {"messages": [HumanMessage(content="hi im bob! and i live in sf")]}, config
+):
+    print(chunk)
+    print("----")
+
+for chunk in agent_executor.stream(
+    {"messages": [HumanMessage(content="whats the weather where I live?")]}, config
+):
+    print(chunk)
+    print("----")
+
+## Setup
+
+### Jupyter Notebook
+
+This guide (and most of the other guides in the documentation) uses [Jupyter notebooks](https://jupyter.org/) and assumes the reader is as well. Jupyter notebooks are perfect interactive environments for learning how to work with LLM systems because oftentimes things can go wrong (unexpected output, API down, etc), and observing these cases is a great way to better understand building with LLMs.
+
+This and other tutorials are perhaps most conveniently run in a Jupyter notebook. See [here](https://jupyter.org/install) for instructions on how to install.
+
+### Installation
+
+To install LangChain run:
+
+%pip install -U langchain-community langgraph langchain-anthropic tavily-python langgraph-checkpoint-sqlite
+
+For more details, see our [Installation guide](/docs/how_to/installation).
+
+### LangSmith
+
+Many of the applications you build with LangChain will contain multiple steps with multiple invocations of LLM calls.
+As these applications get more and more complex, it becomes crucial to be able to inspect what exactly is going on inside your chain or agent.
+The best way to do this is with [LangSmith](https://smith.langchain.com).
+
+After you sign up at the link above, make sure to set your environment variables to start logging traces:
+
+```shell
+export LANGCHAIN_TRACING_V2="true"
+export LANGCHAIN_API_KEY="..."
+```
+
+Or, if in a notebook, you can set them with:
+
+```python
+import getpass
+import os
+
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+os.environ["LANGCHAIN_API_KEY"] = getpass.getpass()
+```
+
+### Tavily
+
+We will be using [Tavily](/docs/integrations/tools/tavily_search) (a search engine) as a tool.
+In order to use it, you will need to get and set an API key:
+
+```bash
+export TAVILY_API_KEY="..."
+```
+
+Or, if in a notebook, you can set it with:
+
+```python
+import getpass
+import os
+
+os.environ["TAVILY_API_KEY"] = getpass.getpass()
+```
+
+## Define tools
+
+We first need to create the tools we want to use. Our main tool of choice will be [Tavily](/docs/integrations/tools/tavily_search) - a search engine. We have a built-in tool in LangChain to easily use Tavily search engine as tool.
+
+
+from langchain_community.tools.tavily_search import TavilySearchResults
+
+search = TavilySearchResults(max_results=2)
+search_results = search.invoke("what is the weather in SF")
+print(search_results)
+# If we want, we can create other tools.
+# Once we have all the tools we want, we can put them in a list that we will reference later.
+tools = [search]
+
+## Using Language Models
+
+Next, let's learn how to use a language model by to call tools. LangChain supports many different language models that you can use interchangably - select the one you want to use below!
+
+import ChatModelTabs from "@theme/ChatModelTabs";
+
+<ChatModelTabs openaiParams={`model="gpt-4"`} />
+
+
+# | output: false
+# | echo: false
+
+from langchain_anthropic import ChatAnthropic
+
+model = ChatAnthropic(model="claude-3-sonnet-20240229")
+
+You can call the language model by passing in a list of messages. By default, the response is a `content` string.
+
+from langchain_core.messages import HumanMessage
+
+response = model.invoke([HumanMessage(content="hi!")])
+response.content
+
+We can now see what it is like to enable this model to do tool calling. In order to enable that we use `.bind_tools` to give the language model knowledge of these tools
+
+model_with_tools = model.bind_tools(tools)
+
+We can now call the model. Let's first call it with a normal message, and see how it responds. We can look at both the `content` field as well as the `tool_calls` field.
+
+response = model_with_tools.invoke([HumanMessage(content="Hi!")])
+
+print(f"ContentString: {response.content}")
+print(f"ToolCalls: {response.tool_calls}")
+
+Now, let's try calling it with some input that would expect a tool to be called.
+
+response = model_with_tools.invoke([HumanMessage(content="What's the weather in SF?")])
+
+print(f"ContentString: {response.content}")
+print(f"ToolCalls: {response.tool_calls}")
+
+We can see that there's now no text content, but there is a tool call! It wants us to call the Tavily Search tool.
+
+This isn't calling that tool yet - it's just telling us to. In order to actually call it, we'll want to create our agent.
+
+## Create the agent
+
+Now that we have defined the tools and the LLM, we can create the agent. We will be using [LangGraph](/docs/concepts/architecture/#langgraph) to construct the agent. 
+Currently, we are using a high level interface to construct the agent, but the nice thing about LangGraph is that this high-level interface is backed by a low-level, highly controllable API in case you want to modify the agent logic.
+
+
+Now, we can initialize the agent with the LLM and the tools.
+
+Note that we are passing in the `model`, not `model_with_tools`. That is because `create_react_agent` will call `.bind_tools` for us under the hood.
+
+from langgraph.prebuilt import create_react_agent
+
+agent_executor = create_react_agent(model, tools)
+
+## Run the agent
+
+We can now run the agent with a few queries! Note that for now, these are all **stateless** queries (it won't remember previous interactions). Note that the agent will return the **final** state at the end of the interaction (which includes any inputs, we will see later on how to get only the outputs).
+
+First up, let's see how it responds when there's no need to call a tool:
+
+response = agent_executor.invoke({"messages": [HumanMessage(content="hi!")]})
+
+response["messages"]
+
+In order to see exactly what is happening under the hood (and to make sure it's not calling a tool) we can take a look at the [LangSmith trace](https://smith.langchain.com/public/28311faa-e135-4d6a-ab6b-caecf6482aaa/r)
+
+Let's now try it out on an example where it should be invoking the tool
+
+response = agent_executor.invoke(
+    {"messages": [HumanMessage(content="whats the weather in sf?")]}
+)
+response["messages"]
+
+We can check out the [LangSmith trace](https://smith.langchain.com/public/f520839d-cd4d-4495-8764-e32b548e235d/r) to make sure it's calling the search tool effectively.
+
+## Streaming Messages
+
+We've seen how the agent can be called with `.invoke` to get  a final response. If the agent executes multiple steps, this may take a while. To show intermediate progress, we can stream back messages as they occur.
+
+for chunk in agent_executor.stream(
+    {"messages": [HumanMessage(content="whats the weather in sf?")]}
+):
+    print(chunk)
+    print("----")
+
+## Streaming tokens
+
+In addition to streaming back messages, it is also useful to stream back tokens.
+We can do this with the `.astream_events` method.
+
+:::important
+This `.astream_events` method only works with Python 3.11 or higher.
+:::
+
+async for event in agent_executor.astream_events(
+    {"messages": [HumanMessage(content="whats the weather in sf?")]}, version="v1"
+):
+    kind = event["event"]
+    if kind == "on_chain_start":
+        if (
+            event["name"] == "Agent"
+        ):  # Was assigned when creating the agent with `.with_config({"run_name": "Agent"})`
+            print(
+                f"Starting agent: {event['name']} with input: {event['data'].get('input')}"
+            )
+    elif kind == "on_chain_end":
+        if (
+            event["name"] == "Agent"
+        ):  # Was assigned when creating the agent with `.with_config({"run_name": "Agent"})`
+            print()
+            print("--")
+            print(
+                f"Done agent: {event['name']} with output: {event['data'].get('output')['output']}"
+            )
+    if kind == "on_chat_model_stream":
+        content = event["data"]["chunk"].content
+        if content:
+            # Empty content in the context of OpenAI means
+            # that the model is asking for a tool to be invoked.
+            # So we only print non-empty content
+            print(content, end="|")
+    elif kind == "on_tool_start":
+        print("--")
+        print(
+            f"Starting tool: {event['name']} with inputs: {event['data'].get('input')}"
+        )
+    elif kind == "on_tool_end":
+        print(f"Done tool: {event['name']}")
+        print(f"Tool output was: {event['data'].get('output')}")
+        print("--")
+
+## Adding in memory
+
+As mentioned earlier, this agent is stateless. This means it does not remember previous interactions. To give it memory we need to pass in a checkpointer. When passing in a checkpointer, we also have to pass in a `thread_id` when invoking the agent (so it knows which thread/conversation to resume from).
+
+from langgraph.checkpoint.memory import MemorySaver
+
+memory = MemorySaver()
+
+agent_executor = create_react_agent(model, tools, checkpointer=memory)
+
+config = {"configurable": {"thread_id": "abc123"}}
+
+for chunk in agent_executor.stream(
+    {"messages": [HumanMessage(content="hi im bob!")]}, config
+):
+    print(chunk)
+    print("----")
+
+for chunk in agent_executor.stream(
+    {"messages": [HumanMessage(content="whats my name?")]}, config
+):
+    print(chunk)
+    print("----")
+
+Example [LangSmith trace](https://smith.langchain.com/public/fa73960b-0f7d-4910-b73d-757a12f33b2b/r)
+
+If you want to start a new conversation, all you have to do is change the `thread_id` used
+
+config = {"configurable": {"thread_id": "xyz123"}}
+for chunk in agent_executor.stream(
+    {"messages": [HumanMessage(content="whats my name?")]}, config
+):
+    print(chunk)
+    print("----")
+
+## Conclusion
+
+That's a wrap! In this quick start we covered how to create a simple agent. 
+We've then shown how to stream back a response - not only with the intermediate steps, but also tokens!
+We've also added in memory so you can have a conversation with them.
+Agents are a complex topic with lots to learn! 
+
+For more information on Agents, please check out the [LangGraph](/docs/concepts/architecture/#langgraph) documentation. This has it's own set of concepts, tutorials, and how-to guides.
+
+
+
+===== Notebook: summarization.ipynb =====
+---
+title: Summarize Text
+sidebar_class_name: hidden
+---
+
+# Summarize Text
+
+:::info
+
+This tutorial demonstrates text summarization using built-in chains and [LangGraph](https://langchain-ai.github.io/langgraph/).
+
+A [previous version](https://python.langchain.com/v0.1/docs/use_cases/summarization/) of this page showcased the legacy chains [StuffDocumentsChain](/docs/versions/migrating_chains/stuff_docs_chain/), [MapReduceDocumentsChain](/docs/versions/migrating_chains/map_reduce_chain/), and [RefineDocumentsChain](https://python.langchain.com/docs/versions/migrating_chains/refine_docs_chain/). See [here](/docs/versions/migrating_chains/) for information on using those abstractions and a comparison with the methods demonstrated in this tutorial.
+
+:::
+
+Suppose you have a set of documents (PDFs, Notion pages, customer questions, etc.) and you want to summarize the content. 
+
+LLMs are a great tool for this given their proficiency in understanding and synthesizing text.
+
+In the context of [retrieval-augmented generation](/docs/tutorials/rag), summarizing text can help distill the information in a large number of retrieved documents to provide context for a LLM.
+
+In this walkthrough we'll go over how to summarize content from multiple documents using LLMs.
+
+![Image description](../../static/img/summarization_use_case_1.png)
+
+## Concepts
+
+Concepts we will cover are:
+
+- Using [language models](/docs/concepts/chat_models).
+
+- Using [document loaders](/docs/concepts/document_loaders), specifically the [WebBaseLoader](https://python.langchain.com/api_reference/community/document_loaders/langchain_community.document_loaders.web_base.WebBaseLoader.html) to load content from an HTML webpage.
+
+- Two ways to summarize or otherwise combine documents.
+  1. [Stuff](/docs/tutorials/summarization#stuff), which simply concatenates documents into a prompt;
+  2. [Map-reduce](/docs/tutorials/summarization#map-reduce), for larger sets of documents. This splits documents into batches, summarizes those, and then summarizes the summaries.
+
+Shorter, targeted guides on these strategies and others, including [iterative refinement](/docs/how_to/summarize_refine), can be found in the [how-to guides](/docs/how_to/#summarization).
+
+## Setup
+
+### Jupyter Notebook
+
+This guide (and most of the other guides in the documentation) uses [Jupyter notebooks](https://jupyter.org/) and assumes the reader is as well. Jupyter notebooks are perfect for learning how to work with LLM systems because oftentimes things can go wrong (unexpected output, API down, etc) and going through guides in an interactive environment is a great way to better understand them.
+
+This and other tutorials are perhaps most conveniently run in a Jupyter notebook. See [here](https://jupyter.org/install) for instructions on how to install.
+
+### Installation
+
+To install LangChain run:
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+import CodeBlock from "@theme/CodeBlock";
+
+<Tabs>
+  <TabItem value="pip" label="Pip" default>
+    <CodeBlock language="bash">pip install langchain</CodeBlock>
+  </TabItem>
+  <TabItem value="conda" label="Conda">
+    <CodeBlock language="bash">conda install langchain -c conda-forge</CodeBlock>
+  </TabItem>
+</Tabs>
+
+
+
+For more details, see our [Installation guide](/docs/how_to/installation).
+
+### LangSmith
+
+Many of the applications you build with LangChain will contain multiple steps with multiple invocations of LLM calls.
+As these applications get more and more complex, it becomes crucial to be able to inspect what exactly is going on inside your chain or agent.
+The best way to do this is with [LangSmith](https://smith.langchain.com).
+
+After you sign up at the link above, make sure to set your environment variables to start logging traces:
+
+```shell
+export LANGCHAIN_TRACING_V2="true"
+export LANGCHAIN_API_KEY="..."
+```
+
+Or, if in a notebook, you can set them with:
+
+```python
+import getpass
+import os
+
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+os.environ["LANGCHAIN_API_KEY"] = getpass.getpass()
+```
+
+## Overview
+
+A central question for building a summarizer is how to pass your documents into the LLM's context window. Two common approaches for this are:
+
+1. `Stuff`: Simply "stuff" all your documents into a single prompt. This is the simplest approach (see [here](/docs/how_to/summarize_stuff/) for more on the `create_stuff_documents_chain` constructor, which is used for this method).
+
+2. `Map-reduce`: Summarize each document on its own in a "map" step and then "reduce" the summaries into a final summary (see [here](https://python.langchain.com/api_reference/langchain/chains/langchain.chains.combine_documents.map_reduce.MapReduceDocumentsChain.html) for more on the `MapReduceDocumentsChain`, which is used for this method).
+
+Note that map-reduce is especially effective when understanding of a sub-document does not rely on preceding context. For example, when summarizing a corpus of many, shorter documents. In other cases, such as summarizing a novel or body of text with an inherent sequence, [iterative refinement](/docs/how_to/summarize_refine) may be more effective.
+
+![Image description](../../static/img/summarization_use_case_2.png)
+
+## Setup
+
+First set environment variables and install packages:
+
+%pip install --upgrade --quiet tiktoken langchain langgraph beautifulsoup4 langchain-community
+
+# Set env var OPENAI_API_KEY or load from a .env file
+# import dotenv
+
+# dotenv.load_dotenv()
+
+import os
+
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+
+First we load in our documents. We will use [WebBaseLoader](https://python.langchain.com/api_reference/community/document_loaders/langchain_community.document_loaders.web_base.WebBaseLoader.html) to load a blog post:
+
+from langchain_community.document_loaders import WebBaseLoader
+
+loader = WebBaseLoader("https://lilianweng.github.io/posts/2023-06-23-agent/")
+docs = loader.load()
+
+Let's next select a LLM:
+
+import ChatModelTabs from "@theme/ChatModelTabs";
+
+<ChatModelTabs
+  customVarName="llm"
+/>
+
+
+# | output: false
+# | echo: false
+
+from langchain_openai import ChatOpenAI
+
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+
+## Stuff: summarize in a single LLM call {#stuff}
+
+We can use [create_stuff_documents_chain](https://python.langchain.com/api_reference/langchain/chains/langchain.chains.combine_documents.stuff.create_stuff_documents_chain.html), especially if using larger context window models such as:
+
+* 128k token OpenAI `gpt-4o` 
+* 200k token Anthropic `claude-3-5-sonnet-20240620`
+
+The chain will take a list of documents, insert them all into a prompt, and pass that prompt to an LLM:
+
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain.chains.llm import LLMChain
+from langchain_core.prompts import ChatPromptTemplate
+
+# Define prompt
+prompt = ChatPromptTemplate.from_messages(
+    [("system", "Write a concise summary of the following:\\n\\n{context}")]
+)
+
+# Instantiate chain
+chain = create_stuff_documents_chain(llm, prompt)
+
+# Invoke chain
+result = chain.invoke({"context": docs})
+print(result)
+
+### Streaming
+
+Note that we can also stream the result token-by-token:
+
+for token in chain.stream({"context": docs}):
+    print(token, end="|")
+
+### Go deeper
+
+* You can easily customize the prompt. 
+* You can easily try different LLMs, (e.g., [Claude](/docs/integrations/chat/anthropic)) via the `llm` parameter.
+
+## Map-Reduce: summarize long texts via parallelization {#map-reduce}
+
+Let's unpack the map reduce approach. For this, we'll first map each document to an individual summary using an LLM. Then we'll reduce or consolidate those summaries into a single global summary.
+
+Note that the map step is typically parallelized over the input documents.
+
+[LangGraph](https://langchain-ai.github.io/langgraph/), built on top of `langchain-core`, supports [map-reduce](https://langchain-ai.github.io/langgraph/how-tos/map-reduce/) workflows and is well-suited to this problem:
+
+- LangGraph allows for individual steps (such as successive summarizations) to be streamed, allowing for greater control of execution;
+- LangGraph's [checkpointing](https://langchain-ai.github.io/langgraph/how-tos/persistence/) supports error recovery, extending with human-in-the-loop workflows, and easier incorporation into conversational applications.
+- The LangGraph implementation is straightforward to modify and extend, as we will see below.
+
+### Map
+Let's first define the prompt associated with the map step. We can use the same summarization prompt as in the `stuff` approach, above:
+
+from langchain_core.prompts import ChatPromptTemplate
+
+map_prompt = ChatPromptTemplate.from_messages(
+    [("system", "Write a concise summary of the following:\\n\\n{context}")]
+)
+
+We can also use the Prompt Hub to store and fetch prompts.
+
+This will work with your [LangSmith API key](https://docs.smith.langchain.com/).
+
+For example, see the map prompt [here](https://smith.langchain.com/hub/rlm/map-prompt).
+
+```python
+from langchain import hub
+
+map_prompt = hub.pull("rlm/map-prompt")
+```
+
+### Reduce
+
+We also define a prompt that takes the document mapping results and reduces them into a single output.
+
+# Also available via the hub: `hub.pull("rlm/reduce-prompt")`
+reduce_template = """
+The following is a set of summaries:
+{docs}
+Take these and distill it into a final, consolidated summary
+of the main themes.
+"""
+
+reduce_prompt = ChatPromptTemplate([("human", reduce_template)])
+
+### Orchestration via LangGraph
+
+Below we implement a simple application that maps the summarization step on a list of documents, then reduces them using the above prompts.
+
+Map-reduce flows are particularly useful when texts are long compared to the context window of a LLM. For long texts, we need a mechanism that ensures that the context to be summarized in the reduce step does not exceed a model's context window size. Here we implement a recursive "collapsing" of the summaries: the inputs are partitioned based on a token limit, and summaries are generated of the partitions. This step is repeated until the total length of the summaries is within a desired limit, allowing for the summarization of arbitrary-length text.
+
+First we chunk the blog post into smaller "sub documents" to be mapped:
+
+from langchain_text_splitters import CharacterTextSplitter
+
+text_splitter = CharacterTextSplitter.from_tiktoken_encoder(
+    chunk_size=1000, chunk_overlap=0
+)
+split_docs = text_splitter.split_documents(docs)
+print(f"Generated {len(split_docs)} documents.")
+
+Next, we define our graph. Note that we define an artificially low maximum token length of 1,000 tokens to illustrate the "collapsing" step.
+
+import operator
+from typing import Annotated, List, Literal, TypedDict
+
+from langchain.chains.combine_documents.reduce import (
+    acollapse_docs,
+    split_list_of_docs,
+)
+from langchain_core.documents import Document
+from langgraph.constants import Send
+from langgraph.graph import END, START, StateGraph
+
+token_max = 1000
+
+
+def length_function(documents: List[Document]) -> int:
+    """Get number of tokens for input contents."""
+    return sum(llm.get_num_tokens(doc.page_content) for doc in documents)
+
+
+# This will be the overall state of the main graph.
+# It will contain the input document contents, corresponding
+# summaries, and a final summary.
+class OverallState(TypedDict):
+    # Notice here we use the operator.add
+    # This is because we want combine all the summaries we generate
+    # from individual nodes back into one list - this is essentially
+    # the "reduce" part
+    contents: List[str]
+    summaries: Annotated[list, operator.add]
+    collapsed_summaries: List[Document]
+    final_summary: str
+
+
+# This will be the state of the node that we will "map" all
+# documents to in order to generate summaries
+class SummaryState(TypedDict):
+    content: str
+
+
+# Here we generate a summary, given a document
+async def generate_summary(state: SummaryState):
+    prompt = map_prompt.invoke(state["content"])
+    response = await llm.ainvoke(prompt)
+    return {"summaries": [response.content]}
+
+
+# Here we define the logic to map out over the documents
+# We will use this an edge in the graph
+def map_summaries(state: OverallState):
+    # We will return a list of `Send` objects
+    # Each `Send` object consists of the name of a node in the graph
+    # as well as the state to send to that node
+    return [
+        Send("generate_summary", {"content": content}) for content in state["contents"]
+    ]
+
+
+def collect_summaries(state: OverallState):
+    return {
+        "collapsed_summaries": [Document(summary) for summary in state["summaries"]]
+    }
+
+
+async def _reduce(input: dict) -> str:
+    prompt = reduce_prompt.invoke(input)
+    response = await llm.ainvoke(prompt)
+    return response.content
+
+
+# Add node to collapse summaries
+async def collapse_summaries(state: OverallState):
+    doc_lists = split_list_of_docs(
+        state["collapsed_summaries"], length_function, token_max
+    )
+    results = []
+    for doc_list in doc_lists:
+        results.append(await acollapse_docs(doc_list, _reduce))
+
+    return {"collapsed_summaries": results}
+
+
+# This represents a conditional edge in the graph that determines
+# if we should collapse the summaries or not
+def should_collapse(
+    state: OverallState,
+) -> Literal["collapse_summaries", "generate_final_summary"]:
+    num_tokens = length_function(state["collapsed_summaries"])
+    if num_tokens > token_max:
+        return "collapse_summaries"
+    else:
+        return "generate_final_summary"
+
+
+# Here we will generate the final summary
+async def generate_final_summary(state: OverallState):
+    response = await _reduce(state["collapsed_summaries"])
+    return {"final_summary": response}
+
+
+# Construct the graph
+# Nodes:
+graph = StateGraph(OverallState)
+graph.add_node("generate_summary", generate_summary)  # same as before
+graph.add_node("collect_summaries", collect_summaries)
+graph.add_node("collapse_summaries", collapse_summaries)
+graph.add_node("generate_final_summary", generate_final_summary)
+
+# Edges:
+graph.add_conditional_edges(START, map_summaries, ["generate_summary"])
+graph.add_edge("generate_summary", "collect_summaries")
+graph.add_conditional_edges("collect_summaries", should_collapse)
+graph.add_conditional_edges("collapse_summaries", should_collapse)
+graph.add_edge("generate_final_summary", END)
+
+app = graph.compile()
+
+LangGraph allows the graph structure to be plotted to help visualize its function:
+
+from IPython.display import Image
+
+Image(app.get_graph().draw_mermaid_png())
+
+When running the application, we can stream the graph to observe its sequence of steps. Below, we will simply print out the name of the step.
+
+Note that because we have a loop in the graph, it can be helpful to specify a [recursion_limit](https://langchain-ai.github.io/langgraph/reference/errors/#langgraph.errors.GraphRecursionError) on its execution. This will raise a specific error when the specified limit is exceeded.
+
+async for step in app.astream(
+    {"contents": [doc.page_content for doc in split_docs]},
+    {"recursion_limit": 10},
+):
+    print(list(step.keys()))
+
+print(step)
+
+In the corresponding [LangSmith trace](https://smith.langchain.com/public/9d7b1d50-e1d6-44c9-9ab2-eabef621c883/r) we can see the individual LLM calls, grouped under their respective nodes.
+
+### Go deeper
+ 
+**Customization** 
+
+* As shown above, you can customize the LLMs and prompts for map and reduce stages.
+
+**Real-world use-case**
+
+* See [this blog post](https://blog.langchain.dev/llms-to-improve-documentation/) case-study on analyzing user interactions (questions about LangChain documentation)!  
+* The blog post and associated [repo](https://github.com/mendableai/QA_clustering) also introduce clustering as a means of summarization.
+* This opens up another path beyond the `stuff` or `map-reduce` approaches that is worth considering.
+
+![Image description](../../static/img/summarization_use_case_3.png)
+
+## Next steps
+
+We encourage you to check out the [how-to guides](/docs/how_to) for more detail on: 
+
+- Other summarization strategies, such as [iterative refinement](/docs/how_to/summarize_refine)
+- Built-in [document loaders](/docs/how_to/#document-loaders) and [text-splitters](/docs/how_to/#text-splitters)
+- Integrating various combine-document chains into a [RAG application](/docs/tutorials/rag/)
+- Incorporating retrieval into a [chatbot](/docs/how_to/chatbots_retrieval/)
+
+and other concepts.
+
+===== Notebook: qa_chat_history.ipynb =====
+---
+sidebar_position: 2
+---
+
+# Build a Retrieval Augmented Generation (RAG) App: Part 2
+
+In many Q&A applications we want to allow the user to have a back-and-forth conversation, meaning the application needs some sort of "memory" of past questions and answers, and some logic for incorporating those into its current thinking.
+
+This is a the second part of a multi-part tutorial:
+
+- [Part 1](/docs/tutorials/rag) introduces RAG and walks through a minimal implementation.
+- [Part 2](/docs/tutorials/qa_chat_history) (this guide) extends the implementation to accommodate conversation-style interactions and multi-step retrieval processes.
+
+Here we focus on **adding logic for incorporating historical messages.** This involves the management of a [chat history](/docs/concepts/chat_history).
+
+We will cover two approaches:
+
+1. [Chains](/docs/tutorials/qa_chat_history/#chains), in which we execute at most one retrieval step;
+2. [Agents](/docs/tutorials/qa_chat_history/#agents), in which we give an LLM discretion to execute multiple retrieval steps.
+
+:::note
+
+The methods presented here leverage [tool-calling](/docs/concepts/tool_calling/) capabilities in modern [chat models](/docs/concepts/chat_models). See [this page](/docs/integrations/chat/) for a table of models supporting tool calling features.
+
+:::
+
+For the external knowledge source, we will use the same [LLM Powered Autonomous Agents](https://lilianweng.github.io/posts/2023-06-23-agent/) blog post by Lilian Weng from the [Part 1](/docs/tutorials/rag) of the RAG tutorial.
+
+## Setup
+
+### Components
+
+We will need to select three components from LangChain's suite of integrations.
+
+import ChatModelTabs from "@theme/ChatModelTabs";
+
+<ChatModelTabs customVarName="llm" />
+
+# | output: false
+# | echo: false
+
+from langchain_openai import ChatOpenAI
+
+llm = ChatOpenAI(model="gpt-4o-mini")
+
+import EmbeddingTabs from "@theme/EmbeddingTabs";
+
+<EmbeddingTabs/>
+
+# | output: false
+# | echo: false
+
+from langchain_openai import OpenAIEmbeddings
+
+embeddings = OpenAIEmbeddings()
+
+import VectorStoreTabs from "@theme/VectorStoreTabs";
+
+<VectorStoreTabs/>
+
+# | output: false
+# | echo: false
+
+from langchain_core.vectorstores import InMemoryVectorStore
+
+vector_store = InMemoryVectorStore(embeddings)
+
+### Dependencies
+
+In addition, we'll use the following packages:
+
+%%capture --no-stderr
+%pip install --upgrade --quiet langgraph langchain-community beautifulsoup4
+
+### LangSmith
+
+Many of the applications you build with LangChain will contain multiple steps with multiple invocations of LLM calls. As these applications get more and more complex, it becomes crucial to be able to inspect what exactly is going on inside your chain or agent. The best way to do this is with [LangSmith](https://smith.langchain.com).
+
+Note that LangSmith is not needed, but it is helpful. If you do want to use LangSmith, after you sign up at the link above, make sure to set your environment variables to start logging traces:
+
+```python
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+if not os.environ.get("LANGCHAIN_API_KEY"):
+    os.environ["LANGCHAIN_API_KEY"] = getpass.getpass()
+```
+
+## Chains {#chains}
+
+Let's first revisit the vector store we built in [Part 1](/docs/tutorials/rag), which indexes an [LLM Powered Autonomous Agents](https://lilianweng.github.io/posts/2023-06-23-agent/) blog post by Lilian Weng.
+
+import bs4
+from langchain import hub
+from langchain_community.document_loaders import WebBaseLoader
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from typing_extensions import List, TypedDict
+
+# Load and chunk contents of the blog
+loader = WebBaseLoader(
+    web_paths=("https://lilianweng.github.io/posts/2023-06-23-agent/",),
+    bs_kwargs=dict(
+        parse_only=bs4.SoupStrainer(
+            class_=("post-content", "post-title", "post-header")
+        )
+    ),
+)
+docs = loader.load()
+
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+all_splits = text_splitter.split_documents(docs)
+
+# Index chunks
+_ = vector_store.add_documents(documents=all_splits)
+
+In the [Part 1](/docs/tutorials/rag) of the RAG tutorial, we represented the user input, retrieved context, and generated answer as separate keys in the state. Conversational experiences can be naturally represented using a sequence of [messages](/docs/concepts/messages/). In addition to messages from the user and assistant, retrieved documents and other artifacts can be incorporated into a message sequence via [tool messages](/docs/concepts/messages/#toolmessage). This motivates us to represent the state of our RAG application using a sequence of messages. Specifically, we will have
+
+1. User input as a `HumanMessage`;
+2. Vector store query as an `AIMessage` with tool calls;
+3. Retrieved documents as a `ToolMessage`;
+4. Final response as a `AIMessage`.
+
+This model for state is so versatile that LangGraph offers a built-in version for convenience:
+
+from langgraph.graph import MessagesState, StateGraph
+
+graph_builder = StateGraph(MessagesState)
+
+Leveraging [tool-calling](/docs/concepts/tool_calling/) to interact with a retrieval step has another benefit, which is that the query for the retrieval is generated by our model. This is especially important in a conversational setting, where user queries may require contextualization based on the chat history. For instance, consider the following exchange:
+
+> Human: "What is Task Decomposition?"
+>
+> AI: "Task decomposition involves breaking down complex tasks into smaller and simpler steps to make them more manageable for an agent or model."
+>
+> Human: "What are common ways of doing it?"
+
+In this scenario, a model could generate a query such as `"common approaches to task decomposition"`. Tool-calling facilitates this naturally. As in the [query analysis](/docs/tutorials/rag#query-analysis) section of the RAG tutorial, this allows a model to rewrite user queries into more effective search queries. It also provides support for direct responses that do not involve a retrieval step (e.g., in response to a generic greeting from the user).
+
+Let's turn our retrieval step into a [tool](/docs/concepts/tools):
+
+from langchain_core.tools import tool
+
+
+@tool(response_format="content_and_artifact")
+def retrieve(query: str):
+    """Retrieve information related to a query."""
+    retrieved_docs = vector_store.similarity_search(query, k=2)
+    serialized = "\n\n".join(
+        (f"Source: {doc.metadata}\n" f"Content: {doc.page_content}")
+        for doc in retrieved_docs
+    )
+    return serialized, retrieved_docs
+
+See [this guide](/docs/how_to/custom_tools/) for more detail on creating tools.
+
+Our graph will consist of three nodes:
+
+1. A node that fields the user input, either generating a query for the retriever or responding directly;
+2. A node for the retriever tool that executes the retrieval step;
+3. A node that generates the final response using the retrieved context.
+
+We build them below. Note that we leverage another pre-built LangGraph component, [ToolNode](https://langchain-ai.github.io/langgraph/reference/prebuilt/#langgraph.prebuilt.tool_node.ToolNode), that executes the tool and adds the result as a `ToolMessage` to the state.
+
+from langchain_core.messages import SystemMessage
+from langgraph.prebuilt import ToolNode
+
+
+# Step 1: Generate an AIMessage that may include a tool-call to be sent.
+def query_or_respond(state: MessagesState):
+    """Generate tool call for retrieval or respond."""
+    llm_with_tools = llm.bind_tools([retrieve])
+    response = llm_with_tools.invoke(state["messages"])
+    # MessagesState appends messages to state instead of overwriting
+    return {"messages": [response]}
+
+
+# Step 2: Execute the retrieval.
+tools = ToolNode([retrieve])
+
+
+# Step 3: Generate a response using the retrieved content.
+def generate(state: MessagesState):
+    """Generate answer."""
+    # Get generated ToolMessages
+    recent_tool_messages = []
+    for message in reversed(state["messages"]):
+        if message.type == "tool":
+            recent_tool_messages.append(message)
+        else:
+            break
+    tool_messages = recent_tool_messages[::-1]
+
+    # Format into prompt
+    docs_content = "\n\n".join(doc.content for doc in tool_messages)
+    system_message_content = (
+        "You are an assistant for question-answering tasks. "
+        "Use the following pieces of retrieved context to answer "
+        "the question. If you don't know the answer, say that you "
+        "don't know. Use three sentences maximum and keep the "
+        "answer concise."
+        "\n\n"
+        f"{docs_content}"
+    )
+    conversation_messages = [
+        message
+        for message in state["messages"]
+        if message.type in ("human", "system")
+        or (message.type == "ai" and not message.tool_calls)
+    ]
+    prompt = [SystemMessage(system_message_content)] + conversation_messages
+
+    # Run
+    response = llm.invoke(prompt)
+    return {"messages": [response]}
+
+Finally, we compile our application into a single `graph` object. In this case, we are just connecting the steps into a sequence. We also allow the first `query_or_respond` step to "short-circuit" and respond directly to the user if it does not generate a tool call. This allows our application to support conversational experiences-- e.g., responding to generic greetings that may not require a retrieval step
+
+from langgraph.graph import END
+from langgraph.prebuilt import ToolNode, tools_condition
+
+graph_builder.add_node(query_or_respond)
+graph_builder.add_node(tools)
+graph_builder.add_node(generate)
+
+graph_builder.set_entry_point("query_or_respond")
+graph_builder.add_conditional_edges(
+    "query_or_respond",
+    tools_condition,
+    {END: END, "tools": "tools"},
+)
+graph_builder.add_edge("tools", "generate")
+graph_builder.add_edge("generate", END)
+
+graph = graph_builder.compile()
+
+from IPython.display import Image, display
+
+display(Image(graph.get_graph().draw_mermaid_png()))
+
+Let's test our application.
+
+Note that it responds appropriately to messages that do not require an additional retrieval step:
+
+input_message = "Hello"
+
+for step in graph.stream(
+    {"messages": [{"role": "user", "content": input_message}]},
+    stream_mode="values",
+):
+    step["messages"][-1].pretty_print()
+
+And when executing a search, we can stream the steps to observe the query generation, retrieval, and answer generation:
+
+input_message = "What is Task Decomposition?"
+
+for step in graph.stream(
+    {"messages": [{"role": "user", "content": input_message}]},
+    stream_mode="values",
+):
+    step["messages"][-1].pretty_print()
+
+Check out the LangSmith trace [here](https://smith.langchain.com/public/70110399-01d3-4b4b-9139-cbcd4edf9d6d/r).
+
+### Stateful management of chat history
+
+:::note
+
+This section of the tutorial previously used the [RunnableWithMessageHistory](https://python.langchain.com/api_reference/core/runnables/langchain_core.runnables.history.RunnableWithMessageHistory.html) abstraction. You can access that version of the documentation in the [v0.2 docs](https://python.langchain.com/v0.2/docs/tutorials/chatbot/).
+
+As of the v0.3 release of LangChain, we recommend that LangChain users take advantage of [LangGraph persistence](https://langchain-ai.github.io/langgraph/concepts/persistence/) to incorporate `memory` into new LangChain applications.
+
+If your code is already relying on `RunnableWithMessageHistory` or `BaseChatMessageHistory`, you do **not** need to make any changes. We do not plan on deprecating this functionality in the near future as it works for simple chat applications and any code that uses `RunnableWithMessageHistory` will continue to work as expected.
+
+Please see [How to migrate to LangGraph Memory](/docs/versions/migrating_memory/) for more details.
+:::
+
+In production, the Q&A application will usually persist the chat history into a database, and be able to read and update it appropriately.
+
+[LangGraph](https://langchain-ai.github.io/langgraph/) implements a built-in [persistence layer](https://langchain-ai.github.io/langgraph/concepts/persistence/), making it ideal for chat applications that support multiple conversational turns.
+
+To manage multiple conversational turns and threads, all we have to do is specify a [checkpointer](https://langchain-ai.github.io/langgraph/concepts/persistence/) when compiling our application. Because the nodes in our graph are appending messages to the state, we will retain a consistent chat history across invocations.
+
+LangGraph comes with a simple in-memory checkpointer, which we use below. See its [documentation](https://langchain-ai.github.io/langgraph/concepts/persistence/) for more detail, including how to use different persistence backends (e.g., SQLite or Postgres).
+
+For a detailed walkthrough of how to manage message history, head to the [How to add message history (memory)](/docs/how_to/message_history) guide.
+
+from langgraph.checkpoint.memory import MemorySaver
+
+memory = MemorySaver()
+graph = graph_builder.compile(checkpointer=memory)
+
+# Specify an ID for the thread
+config = {"configurable": {"thread_id": "abc123"}}
+
+We can now invoke similar to before:
+
+input_message = "What is Task Decomposition?"
+
+for step in graph.stream(
+    {"messages": [{"role": "user", "content": input_message}]},
+    stream_mode="values",
+    config=config,
+):
+    step["messages"][-1].pretty_print()
+
+input_message = "Can you look up some common ways of doing it?"
+
+for step in graph.stream(
+    {"messages": [{"role": "user", "content": input_message}]},
+    stream_mode="values",
+    config=config,
+):
+    step["messages"][-1].pretty_print()
+
+Note that the query generated by the model in the second question incorporates the conversational context.
+
+The [LangSmith](https://smith.langchain.com/public/28e6179f-fc56-45e1-9028-447d76352c14/r) trace is particularly informative here, as we can see exactly what messages are visible to our chat model at each step.
+
+## Agents {#agents}
+
+[Agents](/docs/concepts/agents) leverage the reasoning capabilities of LLMs to make decisions during execution. Using agents allows you to offload additional discretion over the retrieval process. Although their behavior is less predictable than the above "chain", they are able to execute multiple retrieval steps in service of a query, or iterate on a single search.
+
+Below we assemble a minimal RAG agent. Using LangGraph's [pre-built ReAct agent constructor](https://langchain-ai.github.io/langgraph/how-tos/#langgraph.prebuilt.chat_agent_executor.create_react_agent), we can do this in one line.
+
+:::tip
+
+Check out LangGraph's [Agentic RAG](https://langchain-ai.github.io/langgraph/tutorials/rag/langgraph_agentic_rag/) tutorial for more advanced formulations.
+
+:::
+
+from langgraph.prebuilt import create_react_agent
+
+agent_executor = create_react_agent(llm, [retrieve], checkpointer=memory)
+
+Let's inspect the graph:
+
+display(Image(agent_executor.get_graph().draw_mermaid_png()))
+
+The key difference from our earlier implementation is that instead of a final generation step that ends the run, here the tool invocation loops back to the original LLM call. The model can then either answer the question using the retrieved context, or generate another tool call to obtain more information.
+
+Let's test this out. We construct a question that would typically require an iterative sequence of retrieval steps to answer:
+
+config = {"configurable": {"thread_id": "def234"}}
+
+input_message = (
+    "What is the standard method for Task Decomposition?\n\n"
+    "Once you get the answer, look up common extensions of that method."
+)
+
+for event in agent_executor.stream(
+    {"messages": [{"role": "user", "content": input_message}]},
+    stream_mode="values",
+    config=config,
+):
+    event["messages"][-1].pretty_print()
+
+Note that the agent:
+
+1. Generates a query to search for a standard method for task decomposition;
+2. Receiving the answer, generates a second query to search for common extensions of it;
+3. Having received all necessary context, answers the question.
+
+We can see the full sequence of steps, along with latency and other metadata, in the [LangSmith trace](https://smith.langchain.com/public/48cbd35e-9ac1-49ab-8c09-500d54c06b81/r).
+
+## Next steps
+
+We've covered the steps to build a basic conversational Q&A application:
+
+- We used chains to build a predictable application that generates at most one query per user input;
+- We used agents to build an application that can iterate on a sequence of queries.
+
+To explore different types of retrievers and retrieval strategies, visit the [retrievers](/docs/how_to/#retrievers) section of the how-to guides.
+
+For a detailed walkthrough of LangChain's conversation memory abstractions, visit the [How to add message history (memory)](/docs/how_to/message_history) guide.
+
+To learn more about agents, check out the [conceptual guide](/docs/concepts/agents) and LangGraph [agent architectures](https://langchain-ai.github.io/langgraph/concepts/agentic_concepts/) page.
+
+
+
+===== Notebook: classification.ipynb =====
+---
+title: Tagging
+sidebar_class_name: hidden
+---
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/langchain-ai/langchain/blob/master/docs/docs/use_cases/tagging.ipynb)
+
+# Classify Text into Labels
+
+Tagging means labeling a document with classes such as:
+
+- Sentiment
+- Language
+- Style (formal, informal etc.)
+- Covered topics
+- Political tendency
+
+![Image description](../../static/img/tagging.png)
+
+## Overview
+
+Tagging has a few components:
+
+* `function`: Like [extraction](/docs/tutorials/extraction), tagging uses [functions](https://openai.com/blog/function-calling-and-other-api-updates) to specify how the model should tag a document
+* `schema`: defines how we want to tag the document
+
+## Quickstart
+
+Let's see a very straightforward example of how we can use OpenAI tool calling for tagging in LangChain. We'll use the [`with_structured_output`](/docs/how_to/structured_output) method supported by OpenAI models.
+
+%pip install --upgrade --quiet langchain-core
+
+We'll need to load a [chat model](/docs/integrations/chat/):
+
+import ChatModelTabs from "@theme/ChatModelTabs";
+
+<ChatModelTabs customVarName="llm" />
+
+# | output: false
+# | echo: false
+
+from langchain_openai import ChatOpenAI
+
+llm = ChatOpenAI(model="gpt-4o-mini")
+
+Let's specify a Pydantic model with a few properties and their expected type in our schema.
+
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, Field
+
+tagging_prompt = ChatPromptTemplate.from_template(
+    """
+Extract the desired information from the following passage.
+
+Only extract the properties mentioned in the 'Classification' function.
+
+Passage:
+{input}
+"""
+)
+
+
+class Classification(BaseModel):
+    sentiment: str = Field(description="The sentiment of the text")
+    aggressiveness: int = Field(
+        description="How aggressive the text is on a scale from 1 to 10"
+    )
+    language: str = Field(description="The language the text is written in")
+
+
+# LLM
+llm = ChatOpenAI(temperature=0, model="gpt-4o-mini").with_structured_output(
+    Classification
+)
+
+inp = "Estoy increiblemente contento de haberte conocido! Creo que seremos muy buenos amigos!"
+prompt = tagging_prompt.invoke({"input": inp})
+response = llm.invoke(prompt)
+
+response
+
+If we want dictionary output, we can just call `.dict()`
+
+inp = "Estoy muy enojado con vos! Te voy a dar tu merecido!"
+prompt = tagging_prompt.invoke({"input": inp})
+response = llm.invoke(prompt)
+
+response.dict()
+
+As we can see in the examples, it correctly interprets what we want.
+
+The results vary so that we may get, for example, sentiments in different languages ('positive', 'enojado' etc.).
+
+We will see how to control these results in the next section.
+
+## Finer control
+
+Careful schema definition gives us more control over the model's output. 
+
+Specifically, we can define:
+
+- Possible values for each property
+- Description to make sure that the model understands the property
+- Required properties to be returned
+
+Let's redeclare our Pydantic model to control for each of the previously mentioned aspects using enums:
+
+class Classification(BaseModel):
+    sentiment: str = Field(..., enum=["happy", "neutral", "sad"])
+    aggressiveness: int = Field(
+        ...,
+        description="describes how aggressive the statement is, the higher the number the more aggressive",
+        enum=[1, 2, 3, 4, 5],
+    )
+    language: str = Field(
+        ..., enum=["spanish", "english", "french", "german", "italian"]
+    )
+
+tagging_prompt = ChatPromptTemplate.from_template(
+    """
+Extract the desired information from the following passage.
+
+Only extract the properties mentioned in the 'Classification' function.
+
+Passage:
+{input}
+"""
+)
+
+llm = ChatOpenAI(temperature=0, model="gpt-4o-mini").with_structured_output(
+    Classification
+)
+
+Now the answers will be restricted in a way we expect!
+
+inp = "Estoy increiblemente contento de haberte conocido! Creo que seremos muy buenos amigos!"
+prompt = tagging_prompt.invoke({"input": inp})
+llm.invoke(prompt)
+
+inp = "Estoy muy enojado con vos! Te voy a dar tu merecido!"
+prompt = tagging_prompt.invoke({"input": inp})
+llm.invoke(prompt)
+
+inp = "Weather is ok here, I can go outside without much more than a coat"
+prompt = tagging_prompt.invoke({"input": inp})
+llm.invoke(prompt)
+
+The [LangSmith trace](https://smith.langchain.com/public/38294e04-33d8-4c5a-ae92-c2fe68be8332/r) lets us peek under the hood:
+
+![Image description](../../static/img/tagging_trace.png)
+
+### Going deeper
+
+* You can use the [metadata tagger](/docs/integrations/document_transformers/openai_metadata_tagger) document transformer to extract metadata from a LangChain `Document`. 
+* This covers the same basic functionality as the tagging chain, only applied to a LangChain `Document`.
+
+===== Notebook: chatbot.ipynb =====
+---
+sidebar_position: 1
+keywords: [conversationchain]
+---
+
+# Build a Chatbot
+
+:::note
+
+This tutorial previously used the [RunnableWithMessageHistory](https://python.langchain.com/api_reference/core/runnables/langchain_core.runnables.history.RunnableWithMessageHistory.html) abstraction. You can access that version of the documentation in the [v0.2 docs](https://python.langchain.com/v0.2/docs/tutorials/chatbot/).
+
+As of the v0.3 release of LangChain, we recommend that LangChain users take advantage of [LangGraph persistence](https://langchain-ai.github.io/langgraph/concepts/persistence/) to incorporate `memory` into new LangChain applications.
+
+If your code is already relying on `RunnableWithMessageHistory` or `BaseChatMessageHistory`, you do **not** need to make any changes. We do not plan on deprecating this functionality in the near future as it works for simple chat applications and any code that uses `RunnableWithMessageHistory` will continue to work as expected.
+
+Please see [How to migrate to LangGraph Memory](/docs/versions/migrating_memory/) for more details.
+:::
+
+## Overview
+
+We'll go over an example of how to design and implement an LLM-powered chatbot. 
+This chatbot will be able to have a conversation and remember previous interactions with a [chat model](/docs/concepts/chat_models).
+
+
+Note that this chatbot that we build will only use the language model to have a conversation.
+There are several other related concepts that you may be looking for:
+
+- [Conversational RAG](/docs/tutorials/qa_chat_history): Enable a chatbot experience over an external source of data
+- [Agents](/docs/tutorials/agents): Build a chatbot that can take actions
+
+This tutorial will cover the basics which will be helpful for those two more advanced topics, but feel free to skip directly to there should you choose.
+
+## Setup
+
+### Jupyter Notebook
+
+This guide (and most of the other guides in the documentation) uses [Jupyter notebooks](https://jupyter.org/) and assumes the reader is as well. Jupyter notebooks are perfect for learning how to work with LLM systems because oftentimes things can go wrong (unexpected output, API down, etc) and going through guides in an interactive environment is a great way to better understand them.
+
+This and other tutorials are perhaps most conveniently run in a Jupyter notebook. See [here](https://jupyter.org/install) for instructions on how to install.
+
+### Installation
+
+For this tutorial we will need `langchain-core` and `langgraph`. This guide requires `langgraph >= 0.2.28`.
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+import CodeBlock from "@theme/CodeBlock";
+
+<Tabs>
+  <TabItem value="pip" label="Pip" default>
+    <CodeBlock language="bash">pip install langchain-core langgraph>0.2.27</CodeBlock>
+  </TabItem>
+  <TabItem value="conda" label="Conda">
+    <CodeBlock language="bash">conda install langchain-core langgraph>0.2.27 -c conda-forge</CodeBlock>
+  </TabItem>
+</Tabs>
+
+
+
+For more details, see our [Installation guide](/docs/how_to/installation).
+
+### LangSmith
+
+Many of the applications you build with LangChain will contain multiple steps with multiple invocations of LLM calls.
+As these applications get more and more complex, it becomes crucial to be able to inspect what exactly is going on inside your chain or agent.
+The best way to do this is with [LangSmith](https://smith.langchain.com).
+
+After you sign up at the link above, make sure to set your environment variables to start logging traces:
+
+```shell
+export LANGCHAIN_TRACING_V2="true"
+export LANGCHAIN_API_KEY="..."
+```
+
+Or, if in a notebook, you can set them with:
+
+```python
+import getpass
+import os
+
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+os.environ["LANGCHAIN_API_KEY"] = getpass.getpass()
+```
+
+## Quickstart
+
+First up, let's learn how to use a language model by itself. LangChain supports many different language models that you can use interchangeably - select the one you want to use below!
+
+import ChatModelTabs from "@theme/ChatModelTabs";
+
+<ChatModelTabs openaiParams={`model="gpt-4o-mini"`} />
+
+
+# | output: false
+# | echo: false
+
+from langchain_openai import ChatOpenAI
+
+model = ChatOpenAI(model="gpt-4o-mini")
+
+Let's first use the model directly. `ChatModel`s are instances of LangChain "Runnables", which means they expose a standard interface for interacting with them. To just simply call the model, we can pass in a list of messages to the `.invoke` method.
+
+from langchain_core.messages import HumanMessage
+
+model.invoke([HumanMessage(content="Hi! I'm Bob")])
+
+The model on its own does not have any concept of state. For example, if you ask a followup question:
+
+model.invoke([HumanMessage(content="What's my name?")])
+
+Let's take a look at the example [LangSmith trace](https://smith.langchain.com/public/5c21cb92-2814-4119-bae9-d02b8db577ac/r)
+
+We can see that it doesn't take the previous conversation turn into context, and cannot answer the question.
+This makes for a terrible chatbot experience!
+
+To get around this, we need to pass the entire [conversation history](/docs/concepts/chat_history) into the model. Let's see what happens when we do that:
+
+from langchain_core.messages import AIMessage
+
+model.invoke(
+    [
+        HumanMessage(content="Hi! I'm Bob"),
+        AIMessage(content="Hello Bob! How can I assist you today?"),
+        HumanMessage(content="What's my name?"),
+    ]
+)
+
+And now we can see that we get a good response!
+
+This is the basic idea underpinning a chatbot's ability to interact conversationally.
+So how do we best implement this?
+
+## Message persistence
+
+[LangGraph](https://langchain-ai.github.io/langgraph/) implements a built-in persistence layer, making it ideal for chat applications that support multiple conversational turns.
+
+Wrapping our chat model in a minimal LangGraph application allows us to automatically persist the message history, simplifying the development of multi-turn applications.
+
+LangGraph comes with a simple in-memory checkpointer, which we use below. See its [documentation](https://langchain-ai.github.io/langgraph/concepts/persistence/) for more detail, including how to use different persistence backends (e.g., SQLite or Postgres).
+
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import START, MessagesState, StateGraph
+
+# Define a new graph
+workflow = StateGraph(state_schema=MessagesState)
+
+
+# Define the function that calls the model
+def call_model(state: MessagesState):
+    response = model.invoke(state["messages"])
+    return {"messages": response}
+
+
+# Define the (single) node in the graph
+workflow.add_edge(START, "model")
+workflow.add_node("model", call_model)
+
+# Add memory
+memory = MemorySaver()
+app = workflow.compile(checkpointer=memory)
+
+We now need to create a `config` that we pass into the runnable every time. This config contains information that is not part of the input directly, but is still useful. In this case, we want to include a `thread_id`. This should look like:
+
+config = {"configurable": {"thread_id": "abc123"}}
+
+This enables us to support multiple conversation threads with a single application, a common requirement when your application has multiple users.
+
+We can then invoke the application:
+
+query = "Hi! I'm Bob."
+
+input_messages = [HumanMessage(query)]
+output = app.invoke({"messages": input_messages}, config)
+output["messages"][-1].pretty_print()  # output contains all messages in state
+
+query = "What's my name?"
+
+input_messages = [HumanMessage(query)]
+output = app.invoke({"messages": input_messages}, config)
+output["messages"][-1].pretty_print()
+
+Great! Our chatbot now remembers things about us. If we change the config to reference a different `thread_id`, we can see that it starts the conversation fresh.
+
+config = {"configurable": {"thread_id": "abc234"}}
+
+input_messages = [HumanMessage(query)]
+output = app.invoke({"messages": input_messages}, config)
+output["messages"][-1].pretty_print()
+
+However, we can always go back to the original conversation (since we are persisting it in a database)
+
+config = {"configurable": {"thread_id": "abc123"}}
+
+input_messages = [HumanMessage(query)]
+output = app.invoke({"messages": input_messages}, config)
+output["messages"][-1].pretty_print()
+
+This is how we can support a chatbot having conversations with many users!
+
+:::tip
+
+For async support, update the `call_model` node to be an async function and use `.ainvoke` when invoking the application:
+
+```python
+# Async function for node:
+async def call_model(state: MessagesState):
+    response = await model.ainvoke(state["messages"])
+    return {"messages": response}
+
+
+# Define graph as before:
+workflow = StateGraph(state_schema=MessagesState)
+workflow.add_edge(START, "model")
+workflow.add_node("model", call_model)
+app = workflow.compile(checkpointer=MemorySaver())
+
+# Async invocation:
+output = await app.ainvoke({"messages": input_messages}, config)
+output["messages"][-1].pretty_print()
+```
+
+:::
+
+Right now, all we've done is add a simple persistence layer around the model. We can start to make the chatbot more complicated and personalized by adding in a prompt template.
+
+## Prompt templates
+
+[Prompt Templates](/docs/concepts/prompt_templates) help to turn raw user information into a format that the LLM can work with. In this case, the raw user input is just a message, which we are passing to the LLM. Let's now make that a bit more complicated. First, let's add in a system message with some custom instructions (but still taking messages as input). Next, we'll add in more input besides just the messages.
+
+To add in a system message, we will create a `ChatPromptTemplate`. We will utilize `MessagesPlaceholder` to pass all the messages in.
+
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+
+prompt_template = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You talk like a pirate. Answer all questions to the best of your ability.",
+        ),
+        MessagesPlaceholder(variable_name="messages"),
+    ]
+)
+
+We can now update our application to incorporate this template:
+
+workflow = StateGraph(state_schema=MessagesState)
+
+
+def call_model(state: MessagesState):
+    # highlight-start
+    prompt = prompt_template.invoke(state)
+    response = model.invoke(prompt)
+    # highlight-end
+    return {"messages": response}
+
+
+workflow.add_edge(START, "model")
+workflow.add_node("model", call_model)
+
+memory = MemorySaver()
+app = workflow.compile(checkpointer=memory)
+
+We invoke the application in the same way:
+
+config = {"configurable": {"thread_id": "abc345"}}
+query = "Hi! I'm Jim."
+
+input_messages = [HumanMessage(query)]
+output = app.invoke({"messages": input_messages}, config)
+output["messages"][-1].pretty_print()
+
+query = "What is my name?"
+
+input_messages = [HumanMessage(query)]
+output = app.invoke({"messages": input_messages}, config)
+output["messages"][-1].pretty_print()
+
+Awesome! Let's now make our prompt a little bit more complicated. Let's assume that the prompt template now looks something like this:
+
+prompt_template = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are a helpful assistant. Answer all questions to the best of your ability in {language}.",
+        ),
+        MessagesPlaceholder(variable_name="messages"),
+    ]
+)
+
+Note that we have added a new `language` input to the prompt. Our application now has two parameters-- the input `messages` and `language`. We should update our application's state to reflect this:
+
+from typing import Sequence
+
+from langchain_core.messages import BaseMessage
+from langgraph.graph.message import add_messages
+from typing_extensions import Annotated, TypedDict
+
+
+# highlight-next-line
+class State(TypedDict):
+    # highlight-next-line
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+    # highlight-next-line
+    language: str
+
+
+workflow = StateGraph(state_schema=State)
+
+
+def call_model(state: State):
+    prompt = prompt_template.invoke(state)
+    response = model.invoke(prompt)
+    return {"messages": [response]}
+
+
+workflow.add_edge(START, "model")
+workflow.add_node("model", call_model)
+
+memory = MemorySaver()
+app = workflow.compile(checkpointer=memory)
+
+config = {"configurable": {"thread_id": "abc456"}}
+query = "Hi! I'm Bob."
+language = "Spanish"
+
+input_messages = [HumanMessage(query)]
+output = app.invoke(
+    # highlight-next-line
+    {"messages": input_messages, "language": language},
+    config,
+)
+output["messages"][-1].pretty_print()
+
+Note that the entire state is persisted, so we can omit parameters like `language` if no changes are desired:
+
+query = "What is my name?"
+
+input_messages = [HumanMessage(query)]
+output = app.invoke(
+    {"messages": input_messages},
+    config,
+)
+output["messages"][-1].pretty_print()
+
+To help you understand what's happening internally, check out [this LangSmith trace](https://smith.langchain.com/public/15bd8589-005c-4812-b9b9-23e74ba4c3c6/r).
+
+## Managing Conversation History
+
+One important concept to understand when building chatbots is how to manage conversation history. If left unmanaged, the list of messages will grow unbounded and potentially overflow the context window of the LLM. Therefore, it is important to add a step that limits the size of the messages you are passing in.
+
+**Importantly, you will want to do this BEFORE the prompt template but AFTER you load previous messages from Message History.**
+
+We can do this by adding a simple step in front of the prompt that modifies the `messages` key appropriately, and then wrap that new chain in the Message History class. 
+
+LangChain comes with a few built-in helpers for [managing a list of messages](/docs/how_to/#messages). In this case we'll use the [trim_messages](/docs/how_to/trim_messages/) helper to reduce how many messages we're sending to the model. The trimmer allows us to specify how many tokens we want to keep, along with other parameters like if we want to always keep the system message and whether to allow partial messages:
+
+from langchain_core.messages import SystemMessage, trim_messages
+
+trimmer = trim_messages(
+    max_tokens=65,
+    strategy="last",
+    token_counter=model,
+    include_system=True,
+    allow_partial=False,
+    start_on="human",
+)
+
+messages = [
+    SystemMessage(content="you're a good assistant"),
+    HumanMessage(content="hi! I'm bob"),
+    AIMessage(content="hi!"),
+    HumanMessage(content="I like vanilla ice cream"),
+    AIMessage(content="nice"),
+    HumanMessage(content="whats 2 + 2"),
+    AIMessage(content="4"),
+    HumanMessage(content="thanks"),
+    AIMessage(content="no problem!"),
+    HumanMessage(content="having fun?"),
+    AIMessage(content="yes!"),
+]
+
+trimmer.invoke(messages)
+
+To  use it in our chain, we just need to run the trimmer before we pass the `messages` input to our prompt. 
+
+workflow = StateGraph(state_schema=State)
+
+
+def call_model(state: State):
+    # highlight-start
+    trimmed_messages = trimmer.invoke(state["messages"])
+    prompt = prompt_template.invoke(
+        {"messages": trimmed_messages, "language": state["language"]}
+    )
+    response = model.invoke(prompt)
+    # highlight-end
+    return {"messages": [response]}
+
+
+workflow.add_edge(START, "model")
+workflow.add_node("model", call_model)
+
+memory = MemorySaver()
+app = workflow.compile(checkpointer=memory)
+
+Now if we try asking the model our name, it won't know it since we trimmed that part of the chat history:
+
+config = {"configurable": {"thread_id": "abc567"}}
+query = "What is my name?"
+language = "English"
+
+# highlight-next-line
+input_messages = messages + [HumanMessage(query)]
+output = app.invoke(
+    {"messages": input_messages, "language": language},
+    config,
+)
+output["messages"][-1].pretty_print()
+
+But if we ask about information that is within the last few messages, it remembers:
+
+config = {"configurable": {"thread_id": "abc678"}}
+query = "What math problem did I ask?"
+language = "English"
+
+input_messages = messages + [HumanMessage(query)]
+output = app.invoke(
+    {"messages": input_messages, "language": language},
+    config,
+)
+output["messages"][-1].pretty_print()
+
+If you take a look at LangSmith, you can see exactly what is happening under the hood in the [LangSmith trace](https://smith.langchain.com/public/04402eaa-29e6-4bb1-aa91-885b730b6c21/r).
+
+## Streaming
+
+Now we've got a functioning chatbot. However, one *really* important UX consideration for chatbot applications is streaming. LLMs can sometimes take a while to respond, and so in order to improve the user experience one thing that most applications do is stream back each token as it is generated. This allows the user to see progress.
+
+It's actually super easy to do this!
+
+By default, `.stream` in our LangGraph application streams application steps-- in this case, the single step of the model response. Setting `stream_mode="messages"` allows us to stream output tokens instead:
+
+config = {"configurable": {"thread_id": "abc789"}}
+query = "Hi I'm Todd, please tell me a joke."
+language = "English"
+
+input_messages = [HumanMessage(query)]
+# highlight-next-line
+for chunk, metadata in app.stream(
+    {"messages": input_messages, "language": language},
+    config,
+    # highlight-next-line
+    stream_mode="messages",
+):
+    if isinstance(chunk, AIMessage):  # Filter to just model responses
+        print(chunk.content, end="|")
+
+## Next Steps
+
+Now that you understand the basics of how to create a chatbot in LangChain, some more advanced tutorials you may be interested in are:
+
+- [Conversational RAG](/docs/tutorials/qa_chat_history): Enable a chatbot experience over an external source of data
+- [Agents](/docs/tutorials/agents): Build a chatbot that can take actions
+
+If you want to dive deeper on specifics, some things worth checking out are:
+
+- [Streaming](/docs/how_to/streaming): streaming is *crucial* for chat applications
+- [How to add message history](/docs/how_to/message_history): for a deeper dive into all things related to message history
+- [How to manage large message history](/docs/how_to/trim_messages/): more techniques for managing a large chat history
+- [LangGraph main docs](https://langchain-ai.github.io/langgraph/): for more detail on building with LangGraph
+
+===== Notebook: rag.ipynb =====
+# Build a Retrieval Augmented Generation (RAG) App: Part 1
+
+One of the most powerful applications enabled by LLMs is sophisticated question-answering (Q&A) chatbots. These are applications that can answer questions about specific source information. These applications use a technique known as Retrieval Augmented Generation, or [RAG](/docs/concepts/rag/).
+
+This is a multi-part tutorial:
+
+- [Part 1](/docs/tutorials/rag) (this guide) introduces RAG and walks through a minimal implementation.
+- [Part 2](/docs/tutorials/qa_chat_history) extends the implementation to accommodate conversation-style interactions and multi-step retrieval processes.
+
+This tutorial will show how to build a simple Q&A application
+over a text data source. Along the way we’ll go over a typical Q&A
+architecture and highlight additional resources for more advanced Q&A techniques. We’ll also see
+how LangSmith can help us trace and understand our application.
+LangSmith will become increasingly helpful as our application grows in
+complexity.
+
+If you're already familiar with basic retrieval, you might also be interested in
+this [high-level overview of different retrieval techinques](/docs/concepts/retrieval).
+
+**Note**: Here we focus on Q&A for unstructured data. If you are interested for RAG over structured data, check out our tutorial on doing [question/answering over SQL data](/docs/tutorials/sql_qa).
+
+## Overview
+A typical RAG application has two main components:
+
+**Indexing**: a pipeline for ingesting data from a source and indexing it. *This usually happens offline.*
+
+**Retrieval and generation**: the actual RAG chain, which takes the user query at run time and retrieves the relevant data from the index, then passes that to the model.
+
+Note: the indexing portion of this tutorial will largely follow the [semantic search tutorial](/docs/tutorials/retrievers).
+
+The most common full sequence from raw data to answer looks like:
+
+### Indexing
+1. **Load**: First we need to load our data. This is done with [Document Loaders](/docs/concepts/document_loaders).
+2. **Split**: [Text splitters](/docs/concepts/text_splitters) break large `Documents` into smaller chunks. This is useful both for indexing data and passing it into a model, as large chunks are harder to search over and won't fit in a model's finite context window.
+3. **Store**: We need somewhere to store and index our splits, so that they can be searched over later. This is often done using a [VectorStore](/docs/concepts/vectorstores) and [Embeddings](/docs/concepts/embedding_models) model.
+
+![index_diagram](../../static/img/rag_indexing.png)
+
+### Retrieval and generation
+4. **Retrieve**: Given a user input, relevant splits are retrieved from storage using a [Retriever](/docs/concepts/retrievers).
+5. **Generate**: A [ChatModel](/docs/concepts/chat_models) / [LLM](/docs/concepts/text_llms) produces an answer using a prompt that includes both the question with the retrieved data
+
+![retrieval_diagram](../../static/img/rag_retrieval_generation.png)
+
+Once we've indexed our data, we will use [LangGraph](https://langchain-ai.github.io/langgraph/) as our orchestration framework to implement the retrieval and generation steps.
+
+## Setup
+
+### Jupyter Notebook
+
+This and other tutorials are perhaps most conveniently run in a [Jupyter notebooks](https://jupyter.org/). Going through guides in an interactive environment is a great way to better understand them. See [here](https://jupyter.org/install) for instructions on how to install.
+
+### Installation
+
+This tutorial requires these langchain dependencies:
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+import CodeBlock from "@theme/CodeBlock";
+
+<Tabs>
+  <TabItem value="pip" label="Pip" default>
+  
+
+%pip install --quiet --upgrade langchain-text-splitters langchain-community
+
+  </TabItem>
+  <TabItem value="conda" label="Conda">
+    <CodeBlock language="bash">conda install langchain-text-splitters langchain-community -c conda-forge</CodeBlock>
+  </TabItem>
+</Tabs>
+
+
+For more details, see our [Installation guide](/docs/how_to/installation).
+
+### LangSmith
+
+Many of the applications you build with LangChain will contain multiple steps with multiple invocations of LLM calls.
+As these applications get more complex, it becomes crucial to be able to inspect what exactly is going on inside your chain or agent.
+The best way to do this is with [LangSmith](https://smith.langchain.com).
+
+After you sign up at the link above, make sure to set your environment variables to start logging traces:
+
+```shell
+export LANGCHAIN_TRACING_V2="true"
+export LANGCHAIN_API_KEY="..."
+```
+
+Or, if in a notebook, you can set them with:
+
+```python
+import getpass
+import os
+
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+os.environ["LANGCHAIN_API_KEY"] = getpass.getpass()
+```
+
+## Components
+
+We will need to select three components from LangChain's suite of integrations.
+
+import ChatModelTabs from "@theme/ChatModelTabs";
+
+<ChatModelTabs customVarName="llm" />
+
+# | output: false
+# | echo: false
+
+from langchain_openai import ChatOpenAI
+
+llm = ChatOpenAI(model="gpt-4o-mini")
+
+import EmbeddingTabs from "@theme/EmbeddingTabs";
+
+<EmbeddingTabs/>
+
+# | output: false
+# | echo: false
+
+from langchain_openai import OpenAIEmbeddings
+
+embeddings = OpenAIEmbeddings()
+
+import VectorStoreTabs from "@theme/VectorStoreTabs";
+
+<VectorStoreTabs/>
+
+# | output: false
+# | echo: false
+
+from langchain_core.vectorstores import InMemoryVectorStore
+
+vector_store = InMemoryVectorStore(embeddings)
+
+## Preview
+
+In this guide we’ll build an app that answers questions about the website's content. The specific website we will use is the [LLM Powered Autonomous
+Agents](https://lilianweng.github.io/posts/2023-06-23-agent/) blog post
+by Lilian Weng, which allows us to ask questions about the contents of
+the post.
+
+We can create a simple indexing pipeline and RAG chain to do this in ~50
+lines of code.
+
+```python
+import bs4
+from langchain import hub
+from langchain_community.document_loaders import WebBaseLoader
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langgraph.graph import START, StateGraph
+from typing_extensions import List, TypedDict
+
+# Load and chunk contents of the blog
+loader = WebBaseLoader(
+    web_paths=("https://lilianweng.github.io/posts/2023-06-23-agent/",),
+    bs_kwargs=dict(
+        parse_only=bs4.SoupStrainer(
+            class_=("post-content", "post-title", "post-header")
+        )
+    ),
+)
+docs = loader.load()
+
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+all_splits = text_splitter.split_documents(docs)
+
+# Index chunks
+_ = vector_store.add_documents(documents=all_splits)
+
+# Define prompt for question-answering
+prompt = hub.pull("rlm/rag-prompt")
+
+
+# Define state for application
+class State(TypedDict):
+    question: str
+    context: List[Document]
+    answer: str
+
+
+# Define application steps
+def retrieve(state: State):
+    retrieved_docs = vector_store.similarity_search(state["question"])
+    return {"context": retrieved_docs}
+
+
+def generate(state: State):
+    docs_content = "\n\n".join(doc.page_content for doc in state["context"])
+    messages = prompt.invoke({"question": state["question"], "context": docs_content})
+    response = llm.invoke(messages)
+    return {"answer": response.content}
+
+
+# Compile application and test
+graph_builder = StateGraph(State).add_sequence([retrieve, generate])
+graph_builder.add_edge(START, "retrieve")
+graph = graph_builder.compile()
+```
+
+```python
+response = graph.invoke({"question": "What is Task Decomposition?"})
+print(response["answer"])
+```
+
+```
+Task Decomposition is the process of breaking down a complicated task into smaller, manageable steps to facilitate easier execution and understanding. Techniques like Chain of Thought (CoT) and Tree of Thoughts (ToT) guide models to think step-by-step, allowing them to explore multiple reasoning possibilities. This method enhances performance on complex tasks and provides insight into the model's thinking process.
+```
+
+Check out the [LangSmith
+trace](https://smith.langchain.com/public/65030797-7efa-4356-a7bd-b54b3dc70e17/r).
+
+## Detailed walkthrough
+
+Let’s go through the above code step-by-step to really understand what’s
+going on.
+
+## 1. Indexing {#indexing}
+
+:::note
+
+This section is an abbreviated version of the content in the [semantic search tutorial](/docs/tutorials/retrievers).
+If you're comfortable with [document loaders](/docs/concepts/document_loaders), [embeddings](/docs/concepts/embedding_models), and [vector stores](/docs/concepts/vectorstores),
+feel free to skip to the next section on [retrieval and generation](/docs/tutorials/rag/#orchestration).
+
+:::
+
+### Loading documents
+
+We need to first load the blog post contents. We can use
+[DocumentLoaders](/docs/concepts/document_loaders)
+for this, which are objects that load in data from a source and return a
+list of
+[Document](https://python.langchain.com/api_reference/core/documents/langchain_core.documents.base.Document.html)
+objects.
+
+In this case we’ll use the
+[WebBaseLoader](/docs/integrations/document_loaders/web_base),
+which uses `urllib` to load HTML from web URLs and `BeautifulSoup` to
+parse it to text. We can customize the HTML -\> text parsing by passing
+in parameters into the `BeautifulSoup` parser via `bs_kwargs` (see
+[BeautifulSoup
+docs](https://beautiful-soup-4.readthedocs.io/en/latest/#beautifulsoup)).
+In this case only HTML tags with class “post-content”, “post-title”, or
+“post-header” are relevant, so we’ll remove all others.
+
+import bs4
+from langchain_community.document_loaders import WebBaseLoader
+
+# Only keep post title, headers, and content from the full HTML.
+bs4_strainer = bs4.SoupStrainer(class_=("post-title", "post-header", "post-content"))
+loader = WebBaseLoader(
+    web_paths=("https://lilianweng.github.io/posts/2023-06-23-agent/",),
+    bs_kwargs={"parse_only": bs4_strainer},
+)
+docs = loader.load()
+
+assert len(docs) == 1
+print(f"Total characters: {len(docs[0].page_content)}")
+
+print(docs[0].page_content[:500])
+
+#### Go deeper
+
+`DocumentLoader`: Object that loads data from a source as list of `Documents`.
+
+- [Docs](/docs/how_to#document-loaders):
+  Detailed documentation on how to use `DocumentLoaders`.
+- [Integrations](/docs/integrations/document_loaders/): 160+
+  integrations to choose from.
+- [Interface](https://python.langchain.com/api_reference/core/document_loaders/langchain_core.document_loaders.base.BaseLoader.html):
+  API reference for the base interface.
+
+### Splitting documents
+
+Our loaded document is over 42k characters which is too long to fit
+into the context window of many models. Even for those models that could
+fit the full post in their context window, models can struggle to find
+information in very long inputs.
+
+To handle this we’ll split the `Document` into chunks for embedding and
+vector storage. This should help us retrieve only the most relevant parts
+of the blog post at run time.
+
+As in the [semantic search tutorial](/docs/tutorials/retrievers), we use a
+[RecursiveCharacterTextSplitter](/docs/how_to/recursive_text_splitter),
+which will recursively split the document using common separators like
+new lines until each chunk is the appropriate size. This is the
+recommended text splitter for generic text use cases.
+
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1000,  # chunk size (characters)
+    chunk_overlap=200,  # chunk overlap (characters)
+    add_start_index=True,  # track index in original document
+)
+all_splits = text_splitter.split_documents(docs)
+
+print(f"Split blog post into {len(all_splits)} sub-documents.")
+
+#### Go deeper
+
+`TextSplitter`: Object that splits a list of `Document`s into smaller
+chunks. Subclass of `DocumentTransformer`s.
+
+- Learn more about splitting text using different methods by reading the [how-to docs](/docs/how_to#text-splitters)
+- [Code (py or js)](/docs/integrations/document_loaders/source_code)
+- [Scientific papers](/docs/integrations/document_loaders/grobid)
+- [Interface](https://python.langchain.com/api_reference/text_splitters/base/langchain_text_splitters.base.TextSplitter.html): API reference for the base interface.
+
+`DocumentTransformer`: Object that performs a transformation on a list
+of `Document` objects.
+
+- [Docs](/docs/how_to#text-splitters): Detailed documentation on how to use `DocumentTransformers`
+- [Integrations](/docs/integrations/document_transformers/)
+- [Interface](https://python.langchain.com/api_reference/core/documents/langchain_core.documents.transformers.BaseDocumentTransformer.html): API reference for the base interface.
+
+### Storing documents
+
+Now we need to index our 66 text chunks so that we can search over them
+at runtime. Following the [semantic search tutorial](/docs/tutorials/retrievers),
+our approach is to [embed](/docs/concepts/embedding_models/) the contents of each document split and insert these embeddings
+into a [vector store](/docs/concepts/vectorstores/). Given an input query, we can then use
+vector search to retrieve relevant documents.
+
+We can embed and store all of our document splits in a single command
+using the vector store and embeddings model selected at the [start of the tutorial](/docs/tutorials/rag/#components).
+
+document_ids = vector_store.add_documents(documents=all_splits)
+
+print(document_ids[:3])
+
+#### Go deeper
+
+`Embeddings`: Wrapper around a text embedding model, used for converting
+text to embeddings.
+
+- [Docs](/docs/how_to/embed_text): Detailed documentation on how to use embeddings.
+- [Integrations](/docs/integrations/text_embedding/): 30+ integrations to choose from.
+- [Interface](https://python.langchain.com/api_reference/core/embeddings/langchain_core.embeddings.Embeddings.html): API reference for the base interface.
+
+`VectorStore`: Wrapper around a vector database, used for storing and
+querying embeddings.
+
+- [Docs](/docs/how_to/vectorstores): Detailed documentation on how to use vector stores.
+- [Integrations](/docs/integrations/vectorstores/): 40+ integrations to choose from.
+- [Interface](https://python.langchain.com/api_reference/core/vectorstores/langchain_core.vectorstores.base.VectorStore.html): API reference for the base interface.
+
+This completes the **Indexing** portion of the pipeline. At this point
+we have a query-able vector store containing the chunked contents of our
+blog post. Given a user question, we should ideally be able to return
+the snippets of the blog post that answer the question.
+
+## 2. Retrieval and Generation {#orchestration}
+
+Now let’s write the actual application logic. We want to create a simple
+application that takes a user question, searches for documents relevant
+to that question, passes the retrieved documents and initial question to
+a model, and returns an answer.
+
+For generation, we will use the chat model selected at the [start of the tutorial](/docs/tutorials/rag/#components).
+
+We’ll use a prompt for RAG that is checked into the LangChain prompt hub
+([here](https://smith.langchain.com/hub/rlm/rag-prompt)).
+
+from langchain import hub
+
+prompt = hub.pull("rlm/rag-prompt")
+
+example_messages = prompt.invoke(
+    {"context": "(context goes here)", "question": "(question goes here)"}
+).to_messages()
+
+assert len(example_messages) == 1
+print(example_messages[0].content)
+
+We'll use [LangGraph](https://langchain-ai.github.io/langgraph/) to tie together the retrieval and generation steps into a single application. This will bring a number of benefits:
+
+- We can define our application logic once and automatically support multiple invocation modes, including streaming, async, and batched calls.
+- We get streamlined deployments via [LangGraph Platform](https://langchain-ai.github.io/langgraph/concepts/langgraph_platform/).
+- LangSmith will automatically trace the steps of our application together.
+- We can easily add key features to our application, including [persistence](https://langchain-ai.github.io/langgraph/concepts/persistence/) and [human-in-the-loop approval](https://langchain-ai.github.io/langgraph/concepts/human_in_the_loop/), with minimal code changes.
+
+To use LangGraph, we need to define three things:
+
+1. The state of our application;
+2. The nodes of our application (i.e., application steps);
+3. The "control flow" of our application (e.g., the ordering of the steps).
+
+#### State:
+
+The [state](https://langchain-ai.github.io/langgraph/concepts/low_level/#state) of our application controls what data is input to the application, transferred between steps, and output by the application. It is typically a `TypedDict`, but can also be a [Pydantic BaseModel](https://langchain-ai.github.io/langgraph/how-tos/state-model/).
+
+For a simple RAG application, we can just keep track of the input question, retrieved context, and generated answer:
+
+from langchain_core.documents import Document
+from typing_extensions import List, TypedDict
+
+
+class State(TypedDict):
+    question: str
+    context: List[Document]
+    answer: str
+
+#### Nodes (application steps)
+
+Let's start with a simple sequence of two steps: retrieval and generation.
+
+def retrieve(state: State):
+    retrieved_docs = vector_store.similarity_search(state["question"])
+    return {"context": retrieved_docs}
+
+
+def generate(state: State):
+    docs_content = "\n\n".join(doc.page_content for doc in state["context"])
+    messages = prompt.invoke({"question": state["question"], "context": docs_content})
+    response = llm.invoke(messages)
+    return {"answer": response.content}
+
+Our retrieval step simply runs a similarity search using the input question, and the generation step formats the retrieved context and original question into a prompt for the chat model.
+
+#### Control flow
+
+Finally, we compile our application into a single `graph` object. In this case, we are just connecting the retrieval and generation steps into a single sequence.
+
+from langgraph.graph import START, StateGraph
+
+graph_builder = StateGraph(State).add_sequence([retrieve, generate])
+graph_builder.add_edge(START, "retrieve")
+graph = graph_builder.compile()
+
+LangGraph also comes with built-in utilities for visualizing the control flow of your application:
+
+from IPython.display import Image, display
+
+display(Image(graph.get_graph().draw_mermaid_png()))
+
+<details>
+<summary>Do I need to use LangGraph?</summary>
+
+LangGraph is not required to build a RAG application. Indeed, we can implement the same application logic through invocations of the individual components:
+
+```python
+question = "..."
+
+retrieved_docs = vector_store.similarity_search(question)
+docs_content = "\n\n".join(doc.page_content for doc in retrieved_docs)
+prompt = prompt.invoke({"question": question, "context": docs_content})
+answer = llm.invoke(prompt)
+```
+
+The benefits of LangGraph include:
+
+- Support for multiple invocation modes: this logic would need to be rewritten if we wanted to stream output tokens, or stream the results of individual steps;
+- Automatic support for tracing via [LangSmith](https://docs.smith.langchain.com/) and deployments via [LangGraph Platform](https://langchain-ai.github.io/langgraph/concepts/langgraph_platform/);
+- Support for persistence, human-in-the-loop, and other features.
+
+Many use-cases demand RAG in a conversational experience, such that a user can receive context-informed answers via a stateful conversation. As we will see in [Part 2](/docs/tutorials/qa_chat_history) of the tutorial, LangGraph's management and persistence of state simplifies these applications enormously.
+
+</details>
+
+#### Usage
+
+Let's test our application! LangGraph supports multiple invocation modes, including sync, async, and streaming.
+
+Invoke:
+
+result = graph.invoke({"question": "What is Task Decomposition?"})
+
+print(f'Context: {result["context"]}\n\n')
+print(f'Answer: {result["answer"]}')
+
+Stream steps:
+
+for step in graph.stream(
+    {"question": "What is Task Decomposition?"}, stream_mode="updates"
+):
+    print(f"{step}\n\n----------------\n")
+
+Stream [tokens](/docs/concepts/tokens/):
+
+for message, metadata in graph.stream(
+    {"question": "What is Task Decomposition?"}, stream_mode="messages"
+):
+    print(message.content, end="|")
+
+:::tip
+
+For async invocations, use:
+
+```python
+result = await graph.ainvoke(...)
+```
+
+and
+
+```python
+async for step in graph.astream(...):
+```
+
+:::
+
+#### Returning sources
+
+Note that by storing the retrieved context in the state of the graph, we recover sources for the model's generated answer in the `"context"` field of the state. See [this guide](/docs/how_to/qa_sources/) on returning sources for more detail.
+
+#### Go deeper
+
+[Chat models](/docs/concepts/chat_models) take in a sequence of messages and return a message.
+
+- [Docs](/docs/how_to#chat-models)
+- [Integrations](/docs/integrations/chat/): 25+ integrations to choose from.
+- [Interface](https://python.langchain.com/api_reference/core/language_models/langchain_core.language_models.chat_models.BaseChatModel.html): API reference for the base interface.
+
+**Customizing the prompt**
+
+As shown above, we can load prompts (e.g., [this RAG
+prompt](https://smith.langchain.com/hub/rlm/rag-prompt)) from the prompt
+hub. The prompt can also be easily customized. For example:
+
+from langchain_core.prompts import PromptTemplate
+
+template = """Use the following pieces of context to answer the question at the end.
+If you don't know the answer, just say that you don't know, don't try to make up an answer.
+Use three sentences maximum and keep the answer as concise as possible.
+Always say "thanks for asking!" at the end of the answer.
+
+{context}
+
+Question: {question}
+
+Helpful Answer:"""
+custom_rag_prompt = PromptTemplate.from_template(template)
+
+## Query analysis
+
+So far, we are executing the retrieval using the raw input query. However, there are some advantages to allowing a model to generate the query for retrieval purposes. For example:
+
+- In addition to semantic search, we can build in structured filters (e.g., "Find documents since the year 2020.");
+- The model can rewrite user queries, which may be multifaceted or include irrelevant language, into more effective search queries.
+
+[Query analysis](/docs/concepts/retrieval/#query-analysis) employs models to transform or construct optimized search queries from raw user input. We can easily incorporate a query analysis step into our application. For illustrative purposes, let's add some metadata to the documents in our vector store. We will add some (contrived) sections to the document which we can filter on later.
+
+total_documents = len(all_splits)
+third = total_documents // 3
+
+for i, document in enumerate(all_splits):
+    if i < third:
+        document.metadata["section"] = "beginning"
+    elif i < 2 * third:
+        document.metadata["section"] = "middle"
+    else:
+        document.metadata["section"] = "end"
+
+
+all_splits[0].metadata
+
+We will need to update the documents in our vector store. We will use a simple [InMemoryVectorStore](https://python.langchain.com/api_reference/core/vectorstores/langchain_core.vectorstores.in_memory.InMemoryVectorStore.html) for this, as we will use some of its specific features (i.e., metadata filtering). Refer to the vector store [integration documentation](/docs/integrations/vectorstores/) for relevant features of your chosen vector store.
+
+from langchain_core.vectorstores import InMemoryVectorStore
+
+vector_store = InMemoryVectorStore(embeddings)
+_ = vector_store.add_documents(all_splits)
+
+Let's next define a schema for our search query. We will use [structured output](/docs/concepts/structured_outputs/) for this purpose. Here we define a query as containing a string query and a document section (either "beginning", "middle", or "end"), but this can be defined however you like.
+
+from typing import Literal
+
+from typing_extensions import Annotated
+
+
+class Search(TypedDict):
+    """Search query."""
+
+    query: Annotated[str, ..., "Search query to run."]
+    section: Annotated[
+        Literal["beginning", "middle", "end"],
+        ...,
+        "Section to query.",
+    ]
+
+Finally, we add a step to our LangGraph application to generate a query from the user's raw input:
+
+class State(TypedDict):
+    question: str
+    # highlight-next-line
+    query: Search
+    context: List[Document]
+    answer: str
+
+
+# highlight-next-line
+def analyze_query(state: State):
+    # highlight-next-line
+    structured_llm = llm.with_structured_output(Search)
+    # highlight-next-line
+    query = structured_llm.invoke(state["question"])
+    # highlight-next-line
+    return {"query": query}
+
+
+def retrieve(state: State):
+    # highlight-start
+    query = state["query"]
+    retrieved_docs = vector_store.similarity_search(
+        query["query"],
+        filter=lambda doc: doc.metadata.get("section") == query["section"],
+    )
+    # highlight-end
+    return {"context": retrieved_docs}
+
+
+def generate(state: State):
+    docs_content = "\n\n".join(doc.page_content for doc in state["context"])
+    messages = prompt.invoke({"question": state["question"], "context": docs_content})
+    response = llm.invoke(messages)
+    return {"answer": response.content}
+
+
+# highlight-start
+graph_builder = StateGraph(State).add_sequence([analyze_query, retrieve, generate])
+graph_builder.add_edge(START, "analyze_query")
+# highlight-end
+graph = graph_builder.compile()
+
+display(Image(graph.get_graph().draw_mermaid_png()))
+
+We can test our implementation by specifically asking for context from the end of the post. Note that the model includes different information in its answer.
+
+for step in graph.stream(
+    {"question": "What does the end of the post say about Task Decomposition?"},
+    stream_mode="updates",
+):
+    print(f"{step}\n\n----------------\n")
+
+In both the streamed steps and the [LangSmith trace](https://smith.langchain.com/public/bdbaae61-130c-4338-8b59-9315dfee22a0/r), we can now observe the structured query that was fed into the retrieval step.
+
+Query Analysis is a rich problem with a wide range of approaches. Refer to the [how-to guides](/docs/how_to/#query-analysis) for more examples.
+
+## Next steps
+
+We've covered the steps to build a basic Q&A app over data:
+
+- Loading data with a [Document Loader](/docs/concepts/document_loaders)
+- Chunking the indexed data with a [Text Splitter](/docs/concepts/text_splitters) to make it more easily usable by a model
+- [Embedding the data](/docs/concepts/embedding_models) and storing the data in a [vectorstore](/docs/how_to/vectorstores)
+- [Retrieving](/docs/concepts/retrievers) the previously stored chunks in response to incoming questions
+- Generating an answer using the retrieved chunks as context.
+
+In [Part 2](/docs/tutorials/qa_chat_history) of the tutorial, we will extend the implementation here to accommodate conversation-style interactions and multi-step retrieval processes.
+
+Further reading:
+
+- [Return sources](/docs/how_to/qa_sources): Learn how to return source documents
+- [Streaming](/docs/how_to/streaming): Learn how to stream outputs and intermediate steps
+- [Add chat history](/docs/how_to/message_history): Learn how to add chat history to your app
+- [Retrieval conceptual guide](/docs/concepts/retrieval): A high-level overview of specific retrieval techniques
+
+===== Notebook: retrievers.ipynb =====
+# Build a semantic search engine
+
+This tutorial will familiarize you with LangChain's [document loader](/docs/concepts/document_loaders), [embedding](/docs/concepts/embedding_models), and [vector store](/docs/concepts/vectorstores) abstractions. These abstractions are designed to support retrieval of data--  from (vector) databases and other sources--  for integration with LLM workflows. They are important for applications that fetch data to be reasoned over as part of model inference, as in the case of retrieval-augmented generation, or [RAG](/docs/concepts/rag) (see our RAG tutorial [here](/docs/tutorials/rag)).
+
+Here we will build a search engine over a PDF document. This will allow us to retrieve passages in the PDF that are similar to an input query.
+
+## Concepts
+
+This guide focuses on retrieval of text data. We will cover the following concepts:
+
+- Documents and document loaders;
+- Text splitters;
+- Embeddings;
+- Vector stores and retrievers.
+
+## Setup
+
+### Jupyter Notebook
+
+This and other tutorials are perhaps most conveniently run in a Jupyter notebook. See [here](https://jupyter.org/install) for instructions on how to install.
+
+### Installation
+
+This tutorial requires the `langchain-community` and `pypdf` packages:
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+import CodeBlock from "@theme/CodeBlock";
+
+<Tabs>
+  <TabItem value="pip" label="Pip" default>
+    <CodeBlock language="bash">pip install langchain-community pypdf</CodeBlock>
+  </TabItem>
+  <TabItem value="conda" label="Conda">
+    <CodeBlock language="bash">conda install langchain-community pypdf -c conda-forge</CodeBlock>
+  </TabItem>
+</Tabs>
+
+
+For more details, see our [Installation guide](/docs/how_to/installation).
+
+### LangSmith
+
+Many of the applications you build with LangChain will contain multiple steps with multiple invocations of LLM calls.
+As these applications get more and more complex, it becomes crucial to be able to inspect what exactly is going on inside your chain or agent.
+The best way to do this is with [LangSmith](https://smith.langchain.com).
+
+After you sign up at the link above, make sure to set your environment variables to start logging traces:
+
+```shell
+export LANGCHAIN_TRACING_V2="true"
+export LANGCHAIN_API_KEY="..."
+```
+
+Or, if in a notebook, you can set them with:
+
+```python
+import getpass
+import os
+
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+os.environ["LANGCHAIN_API_KEY"] = getpass.getpass()
+```
+
+
+## Documents and Document Loaders
+
+LangChain implements a [Document](https://python.langchain.com/api_reference/core/documents/langchain_core.documents.base.Document.html) abstraction, which is intended to represent a unit of text and associated metadata. It has three attributes:
+
+- `page_content`: a string representing the content;
+- `metadata`: a dict containing arbitrary metadata;
+- `id`: (optional) a string identifier for the document.
+
+The `metadata` attribute can capture information about the source of the document, its relationship to other documents, and other information. Note that an individual `Document` object often represents a chunk of a larger document.
+
+We can generate sample documents when desired:
+```python
+from langchain_core.documents import Document
+
+documents = [
+    Document(
+        page_content="Dogs are great companions, known for their loyalty and friendliness.",
+        metadata={"source": "mammal-pets-doc"},
+    ),
+    Document(
+        page_content="Cats are independent pets that often enjoy their own space.",
+        metadata={"source": "mammal-pets-doc"},
+    ),
+]
+```
+
+However, the LangChain ecosystem implements [document loaders](/docs/concepts/document_loaders) that [integrate with hundreds of common sources](/docs/integrations/document_loaders/). This makes it easy to incorporate data from these sources into your AI application.
+
+### Loading documents
+
+Let's load a PDF into a sequence of `Document` objects. There is a sample PDF in the LangChain repo [here](https://github.com/langchain-ai/langchain/tree/master/docs/docs/example_data) -- a 10-k filing for Nike from 2023. We can consult the LangChain documentation for [available PDF document loaders](/docs/integrations/document_loaders/#pdfs). Let's select [PyPDFLoader](/docs/integrations/document_loaders/pypdfloader/), which is fairly lightweight.
+
+from langchain_community.document_loaders import PyPDFLoader
+
+file_path = "../example_data/nke-10k-2023.pdf"
+loader = PyPDFLoader(file_path)
+
+docs = loader.load()
+
+print(len(docs))
+
+:::tip
+
+See [this guide](/docs/how_to/document_loader_pdf/) for more detail on PDF document loaders.
+
+:::
+
+`PyPDFLoader` loads one `Document` object per PDF page. For each, we can easily access:
+
+- The string content of the page;
+- Metadata containing the file name and page number.
+
+print(f"{docs[0].page_content[:200]}\n")
+print(docs[0].metadata)
+
+### Splitting
+
+For both information retrieval and downstream question-answering purposes, a page may be too coarse a representation. Our goal in the end will be to retrieve `Document` objects that answer an input query, and further splitting our PDF will help ensure that the meanings of relevant portions of the document are not "washed out" by surrounding text.
+
+We can use [text splitters](/docs/concepts/text_splitters) for this purpose. Here we will use a simple text splitter that partitions based on characters. We will split our documents into chunks of 1000 characters
+with 200 characters of overlap between chunks. The overlap helps
+mitigate the possibility of separating a statement from important
+context related to it. We use the
+[RecursiveCharacterTextSplitter](/docs/how_to/recursive_text_splitter),
+which will recursively split the document using common separators like
+new lines until each chunk is the appropriate size. This is the
+recommended text splitter for generic text use cases.
+
+We set `add_start_index=True` so that the character index where each
+split Document starts within the initial Document is preserved as
+metadata attribute “start_index”.
+
+See [this guide](/docs/how_to/document_loader_pdf/) for more detail about working with PDFs, including how to extract text from specific sections and images. 
+
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1000, chunk_overlap=200, add_start_index=True
+)
+all_splits = text_splitter.split_documents(docs)
+
+len(all_splits)
+
+## Embeddings
+
+Vector search is a common way to store and search over unstructured data (such as unstructured text). The idea is to store numeric vectors that are associated with the text. Given a query, we can [embed](/docs/concepts/embedding_models) it as a vector of the same dimension and use vector similarity metrics (such as cosine similarity) to identify related text.
+
+LangChain supports embeddings from [dozens of providers](/docs/integrations/text_embedding/). These models specify how text should be converted into a numeric vector. Let's select a model:
+
+import EmbeddingTabs from "@theme/EmbeddingTabs";
+
+<EmbeddingTabs customVarName="embeddings" />
+
+# | output: false
+# | echo: false
+
+from langchain_openai import OpenAIEmbeddings
+
+embeddings = OpenAIEmbeddings()
+
+vector_1 = embeddings.embed_query(all_splits[0].page_content)
+vector_2 = embeddings.embed_query(all_splits[1].page_content)
+
+assert len(vector_1) == len(vector_2)
+print(f"Generated vectors of length {len(vector_1)}\n")
+print(vector_1[:10])
+
+Armed with a model for generating text embeddings, we can next store them in a special data structure that supports efficient similarity search.
+
+## Vector stores
+
+LangChain [VectorStore](https://python.langchain.com/api_reference/core/vectorstores/langchain_core.vectorstores.base.VectorStore.html) objects contain methods for adding text and `Document` objects to the store, and querying them using various similarity metrics. They are often initialized with [embedding](/docs/how_to/embed_text) models, which determine how text data is translated to numeric vectors.
+
+LangChain includes a suite of [integrations](/docs/integrations/vectorstores) with different vector store technologies. Some vector stores are hosted by a provider (e.g., various cloud providers) and require specific credentials to use; some (such as [Postgres](/docs/integrations/vectorstores/pgvector)) run in separate infrastructure that can be run locally or via a third-party; others can run in-memory for lightweight workloads. Let's select a vector store:
+
+import VectorStoreTabs from "@theme/VectorStoreTabs";
+
+<VectorStoreTabs/>
+
+# | output: false
+# | echo: false
+
+from langchain_chroma import Chroma
+
+vector_store = Chroma(embedding_function=embeddings)
+
+Having instantiated our vector store, we can now index the documents.
+
+ids = vector_store.add_documents(documents=all_splits)
+
+Note that most vector store implementations will allow you to connect to an existing vector store--  e.g., by providing a client, index name, or other information. See the documentation for a specific [integration](/docs/integrations/vectorstores) for more detail.
+
+Once we've instantiated a `VectorStore` that contains documents, we can query it. [VectorStore](https://python.langchain.com/api_reference/core/vectorstores/langchain_core.vectorstores.base.VectorStore.html) includes methods for querying:
+- Synchronously and asynchronously;
+- By string query and by vector;
+- With and without returning similarity scores;
+- By similarity and [maximum marginal relevance](https://python.langchain.com/api_reference/core/vectorstores/langchain_core.vectorstores.base.VectorStore.html#langchain_core.vectorstores.base.VectorStore.max_marginal_relevance_search) (to balance similarity with query to diversity in retrieved results).
+
+The methods will generally include a list of [Document](https://python.langchain.com/api_reference/core/documents/langchain_core.documents.base.Document.html#langchain_core.documents.base.Document) objects in their outputs.
+
+### Usage
+
+Embeddings typically represent text as a "dense" vector such that texts with similar meanings are geometrically close. This lets us retrieve relevant information just by passing in a question, without knowledge of any specific key-terms used in the document.
+
+Return documents based on similarity to a string query:
+
+results = vector_store.similarity_search(
+    "How many distribution centers does Nike have in the US?"
+)
+
+print(results[0])
+
+Async query:
+
+results = await vector_store.asimilarity_search("When was Nike incorporated?")
+
+print(results[0])
+
+Return scores:
+
+# Note that providers implement different scores; the score here
+# is a distance metric that varies inversely with similarity.
+
+results = vector_store.similarity_search_with_score("What was Nike's revenue in 2023?")
+doc, score = results[0]
+print(f"Score: {score}\n")
+print(doc)
+
+Return documents based on similarity to an embedded query:
+
+embedding = embeddings.embed_query("How were Nike's margins impacted in 2023?")
+
+results = vector_store.similarity_search_by_vector(embedding)
+print(results[0])
+
+Learn more:
+
+- [API reference](https://python.langchain.com/api_reference/core/vectorstores/langchain_core.vectorstores.base.VectorStore.html)
+- [How-to guide](/docs/how_to/vectorstores)
+- [Integration-specific docs](/docs/integrations/vectorstores)
+
+## Retrievers
+
+LangChain `VectorStore` objects do not subclass [Runnable](https://python.langchain.com/api_reference/core/index.html#langchain-core-runnables). LangChain [Retrievers](https://python.langchain.com/api_reference/core/index.html#langchain-core-retrievers) are Runnables, so they implement a standard set of methods (e.g., synchronous and asynchronous `invoke` and `batch` operations). Although we can construct retrievers from vector stores, retrievers can interface with non-vector store sources of data, as well (such as external APIs).
+
+We can create a simple version of this ourselves, without subclassing `Retriever`. If we choose what method we wish to use to retrieve documents, we can create a runnable easily. Below we will build one around the `similarity_search` method:
+
+from typing import List
+
+from langchain_core.documents import Document
+from langchain_core.runnables import chain
+
+
+@chain
+def retriever(query: str) -> List[Document]:
+    return vector_store.similarity_search(query, k=1)
+
+
+retriever.batch(
+    [
+        "How many distribution centers does Nike have in the US?",
+        "When was Nike incorporated?",
+    ],
+)
+
+Vectorstores implement an `as_retriever` method that will generate a Retriever, specifically a [VectorStoreRetriever](https://python.langchain.com/api_reference/core/vectorstores/langchain_core.vectorstores.base.VectorStoreRetriever.html). These retrievers include specific `search_type` and `search_kwargs` attributes that identify what methods of the underlying vector store to call, and how to parameterize them. For instance, we can replicate the above with the following:
+
+retriever = vector_store.as_retriever(
+    search_type="similarity",
+    search_kwargs={"k": 1},
+)
+
+retriever.batch(
+    [
+        "How many distribution centers does Nike have in the US?",
+        "When was Nike incorporated?",
+    ],
+)
+
+`VectorStoreRetriever` supports search types of `"similarity"` (default), `"mmr"` (maximum marginal relevance, described above), and `"similarity_score_threshold"`. We can use the latter to threshold documents output by the retriever by similarity score.
+
+Retrievers can easily be incorporated into more complex applications, such as [retrieval-augmented generation (RAG)](/docs/concepts/rag) applications that combine a given question with retrieved context into a prompt for a LLM. To learn more about building such an application, check out the [RAG tutorial](/docs/tutorials/rag) tutorial.
+
+### Learn more:
+
+Retrieval strategies can be rich and complex. For example:
+
+- We can [infer hard rules and filters](/docs/how_to/self_query/) from a query (e.g., "using documents published after 2020");
+- We can [return documents that are linked](/docs/how_to/parent_document_retriever/) to the retrieved context in some way (e.g., via some document taxonomy);
+- We can generate [multiple embeddings](/docs/how_to/multi_vector) for each unit of context;
+- We can [ensemble results](/docs/how_to/ensemble_retriever) from multiple retrievers;
+- We can assign weights to documents, e.g., to weigh [recent documents](/docs/how_to/time_weighted_vectorstore/) higher.
+
+The [retrievers](/docs/how_to#retrievers) section of the how-to guides covers these and other built-in retrieval strategies.
+
+It is also straightforward to extend the [BaseRetriever](https://python.langchain.com/api_reference/core/retrievers/langchain_core.retrievers.BaseRetriever.html) class in order to implement custom retrievers. See our how-to guide [here](/docs/how_to/custom_retriever).
+
+
+## Next steps
+
+You've now seen how to build a semantic search engine over a PDF document.
+
+For more on document loaders:
+
+- [Conceptual guide](/docs/concepts/document_loaders)
+- [How-to guides](/docs/how_to/#document-loaders)
+- [Available integrations](/docs/integrations/document_loaders/)
+
+For more on embeddings:
+
+- [Conceptual guide](/docs/concepts/embedding_models/)
+- [How-to guides](/docs/how_to/#embedding-models)
+- [Available integrations](/docs/integrations/text_embedding/)
+
+For more on vector stores:
+
+- [Conceptual guide](/docs/concepts/vectorstores/)
+- [How-to guides](/docs/how_to/#vector-stores)
+- [Available integrations](/docs/integrations/vectorstores/)
+
+For more on RAG, see:
+
+- [Build a Retrieval Augmented Generation (RAG) App](/docs/tutorials/rag/)
+- [Related how-to guides](/docs/how_to/#qa-with-rag)
+
+===== Notebook: sql_qa.ipynb =====
+# Build a Question/Answering system over SQL data
+
+:::info Prerequisites
+
+This guide assumes familiarity with the following concepts:
+
+- [Chat models](/docs/concepts/chat_models)
+- [Tools](/docs/concepts/tools)
+- [Agents](/docs/concepts/agents)
+- [LangGraph](/docs/concepts/architecture/#langgraph)
+
+:::
+
+Enabling a LLM system to query structured data can be qualitatively different from unstructured text data. Whereas in the latter it is common to generate text that can be searched against a vector database, the approach for structured data is often for the LLM to write and execute queries in a DSL, such as SQL. In this guide we'll go over the basic ways to create a Q&A system over tabular data in databases. We will cover implementations using both [chains](/docs/tutorials/sql_qa#chains) and [agents](/docs/tutorials/sql_qa#agents). These systems will allow us to ask a question about the data in a database and get back a natural language answer. The main difference between the two is that our agent can query the database in a loop as many times as it needs to answer the question.
+
+## ⚠️ Security note ⚠️
+
+Building Q&A systems of SQL databases requires executing model-generated SQL queries. There are inherent risks in doing this. Make sure that your database connection permissions are always scoped as narrowly as possible for your chain/agent's needs. This will mitigate though not eliminate the risks of building a model-driven system. For more on general security best practices, [see here](/docs/security).
+
+
+## Architecture
+
+At a high-level, the steps of these systems are:
+
+1. **Convert question to SQL query**: Model converts user input to a SQL query.
+2. **Execute SQL query**: Execute the query.
+3. **Answer the question**: Model responds to user input using the query results.
+
+Note that querying data in CSVs can follow a similar approach. See our [how-to guide](/docs/how_to/sql_csv) on question-answering over CSV data for more detail.
+
+![sql_usecase.png](../../static/img/sql_usecase.png)
+
+## Setup
+
+First, get required packages and set environment variables:
+
+%%capture --no-stderr
+%pip install --upgrade --quiet langchain-community langchainhub langgraph
+
+```python
+# Comment out the below to opt-out of using LangSmith in this notebook. Not required.
+if not os.environ.get("LANGCHAIN_API_KEY"):
+    os.environ["LANGCHAIN_API_KEY"] = getpass.getpass()
+    os.environ["LANGCHAIN_TRACING_V2"] = "true"
+```
+
+### Sample data
+
+The below example will use a SQLite connection with the Chinook database, which is a sample database that represents a digital media store. Follow [these installation steps](https://database.guide/2-sample-databases-sqlite/) to create `Chinook.db` in the same directory as this notebook. You can also download and build the database via the command line:
+```bash
+curl -s https://raw.githubusercontent.com/lerocha/chinook-database/master/ChinookDatabase/DataSources/Chinook_Sqlite.sql | sqlite3 Chinook.db
+```
+
+Now, `Chinook.db` is in our directory and we can interface with it using the SQLAlchemy-driven `SQLDatabase` class:
+
+from langchain_community.utilities import SQLDatabase
+
+db = SQLDatabase.from_uri("sqlite:///Chinook.db")
+print(db.dialect)
+print(db.get_usable_table_names())
+db.run("SELECT * FROM Artist LIMIT 10;")
+
+Great! We've got a SQL database that we can query. Now let's try hooking it up to an LLM.
+
+## Chains {#chains}
+
+Chains are compositions of predictable steps. In [LangGraph](/docs/concepts/architecture/#langgraph), we can represent a chain via simple sequence of nodes. Let's create a sequence of steps that, given a question, does the following:
+- converts the question into a SQL query;
+- executes the query;
+- uses the result to answer the original question.
+
+There are scenarios not supported by this arrangement. For example, this system will execute a SQL query for any user input-- even "hello". Importantly, as we'll see below, some questions require more than one query to answer. We will address these scenarios in the Agents section.
+
+### Application state
+
+The LangGraph [state](https://langchain-ai.github.io/langgraph/concepts/low_level/#state) of our application controls what data is input to the application, transferred between steps, and output by the application. It is typically a `TypedDict`, but can also be a [Pydantic BaseModel](https://langchain-ai.github.io/langgraph/how-tos/state-model/).
+
+For this application, we can just keep track of the input question, generated query, query result, and generated answer:
+
+from typing_extensions import TypedDict
+
+
+class State(TypedDict):
+    question: str
+    query: str
+    result: str
+    answer: str
+
+Now we just need functions that operate on this state and populate its contents.
+
+### Convert question to SQL query
+
+The first step is to take the user input and convert it to a SQL query. To reliably obtain SQL queries (absent markdown formatting and explanations or clarifications), we will make use of LangChain's [structured output](/docs/concepts/structured_outputs/) abstraction.
+
+Let's select a chat model for our application:
+
+import ChatModelTabs from "@theme/ChatModelTabs";
+
+<ChatModelTabs customVarName="llm" />
+
+
+# | output: false
+# | echo: false
+
+from langchain_openai import ChatOpenAI
+
+llm = ChatOpenAI(model="gpt-4o", temperature=0)
+
+We will pull a prompt from the [Prompt Hub](https://smith.langchain.com/hub) to instruct the model.
+
+from langchain import hub
+
+query_prompt_template = hub.pull("langchain-ai/sql-query-system-prompt")
+
+assert len(query_prompt_template.messages) == 1
+query_prompt_template.messages[0].pretty_print()
+
+The prompt includes several parameters we will need to populate, such as the SQL dialect and table schemas. LangChain's [SQLDatabase](https://python.langchain.com/api_reference/community/utilities/langchain_community.utilities.sql_database.SQLDatabase.html) object includes methods to help with this. Our `write_query` step will just populate these parameters and prompt a model to generate the SQL query:
+
+from typing_extensions import Annotated
+
+
+class QueryOutput(TypedDict):
+    """Generated SQL query."""
+
+    query: Annotated[str, ..., "Syntactically valid SQL query."]
+
+
+def write_query(state: State):
+    """Generate SQL query to fetch information."""
+    prompt = query_prompt_template.invoke(
+        {
+            "dialect": db.dialect,
+            "top_k": 10,
+            "table_info": db.get_table_info(),
+            "input": state["question"],
+        }
+    )
+    structured_llm = llm.with_structured_output(QueryOutput)
+    result = structured_llm.invoke(prompt)
+    return {"query": result["query"]}
+
+Let's test it out:
+
+write_query({"question": "How many Employees are there?"})
+
+### Execute query
+
+**This is the most dangerous part of creating a SQL chain.** Consider carefully if it is OK to run automated queries over your data. Minimize the database connection permissions as much as possible. Consider adding a human approval step to you chains before query execution (see below).
+
+To execute the query, we will load a tool from [langchain-community](/docs/concepts/architecture/#langchain-community). Our `execute_query` node will just wrap this tool:
+
+from langchain_community.tools.sql_database.tool import QuerySQLDatabaseTool
+
+
+def execute_query(state: State):
+    """Execute SQL query."""
+    execute_query_tool = QuerySQLDatabaseTool(db=db)
+    return {"result": execute_query_tool.invoke(state["query"])}
+
+Testing this step:
+
+execute_query({"query": "SELECT COUNT(EmployeeId) AS EmployeeCount FROM Employee;"})
+
+### Generate answer
+
+Finally, our last step generates an answer to the question given the information pulled from the database:
+
+def generate_answer(state: State):
+    """Answer question using retrieved information as context."""
+    prompt = (
+        "Given the following user question, corresponding SQL query, "
+        "and SQL result, answer the user question.\n\n"
+        f'Question: {state["question"]}\n'
+        f'SQL Query: {state["query"]}\n'
+        f'SQL Result: {state["result"]}'
+    )
+    response = llm.invoke(prompt)
+    return {"answer": response.content}
+
+### Orchestrating with LangGraph
+
+Finally, we compile our application into a single `graph` object. In this case, we are just connecting the three steps into a single sequence.
+
+from langgraph.graph import START, StateGraph
+
+graph_builder = StateGraph(State).add_sequence(
+    [write_query, execute_query, generate_answer]
+)
+graph_builder.add_edge(START, "write_query")
+graph = graph_builder.compile()
+
+LangGraph also comes with built-in utilities for visualizing the control flow of your application:
+
+from IPython.display import Image, display
+
+display(Image(graph.get_graph().draw_mermaid_png()))
+
+Let's test our application! Note that we can stream the results of individual steps:
+
+for step in graph.stream(
+    {"question": "How many employees are there?"}, stream_mode="updates"
+):
+    print(step)
+
+Check out the [LangSmith trace](https://smith.langchain.com/public/30a79380-6ba6-46af-8bd9-5d1df0b9ccca/r).
+
+### Human-in-the-loop
+
+LangGraph supports a number of features that can be useful for this workflow. One of them is [human-in-the-loop](https://langchain-ai.github.io/langgraph/concepts/human_in_the_loop/): we can interrupt our application before sensitive steps (such as the execution of a SQL query) for human review. This is enabled by LangGraph's [persistence](https://langchain-ai.github.io/langgraph/concepts/persistence/) layer, which saves run progress to your storage of choice. Below, we specify storage in-memory:
+
+from langgraph.checkpoint.memory import MemorySaver
+
+memory = MemorySaver()
+graph = graph_builder.compile(checkpointer=memory, interrupt_before=["execute_query"])
+
+# Now that we're using persistence, we need to specify a thread ID
+# so that we can continue the run after review.
+config = {"configurable": {"thread_id": "1"}}
+
+display(Image(graph.get_graph().draw_mermaid_png()))
+
+Let's repeat the same run, adding in a simple yes/no approval step:
+
+for step in graph.stream(
+    {"question": "How many employees are there?"},
+    config,
+    stream_mode="updates",
+):
+    print(step)
+
+try:
+    user_approval = input("Do you want to go to execute query? (yes/no): ")
+except Exception:
+    user_approval = "no"
+
+if user_approval.lower() == "yes":
+    # If approved, continue the graph execution
+    for step in graph.stream(None, config, stream_mode="updates"):
+        print(step)
+else:
+    print("Operation cancelled by user.")
+
+See [this](https://langchain-ai.github.io/langgraph/concepts/human_in_the_loop/) LangGraph guide for more detail and examples.
+
+### Next steps
+
+For more complex query-generation, we may want to create few-shot prompts or add query-checking steps. For advanced techniques like this and more check out:
+
+* [Prompting strategies](/docs/how_to/sql_prompting): Advanced prompt engineering techniques.
+* [Query checking](/docs/how_to/sql_query_checking): Add query validation and error handling.
+* [Large databases](/docs/how_to/sql_large_db): Techniques for working with large databases.
+
+## Agents {#agents}
+
+[Agents](/docs/concepts/agents) leverage the reasoning capabilities of LLMs to make decisions during execution. Using agents allows you to offload additional discretion over the query generation and execution process. Although their behavior is less predictable than the above "chain", they feature some advantages:
+
+- They can query the database as many times as needed to answer the user question.
+- They can recover from errors by running a generated query, catching the traceback and regenerating it correctly.
+- They can answer questions based on the databases' schema as well as on the databases' content (like describing a specific table).
+
+
+Below we assemble a minimal SQL agent. We will equip it with a set of tools using LangChain's [SQLDatabaseToolkit](https://python.langchain.com/api_reference/community/agent_toolkits/langchain_community.agent_toolkits.sql.toolkit.SQLDatabaseToolkit.html). Using LangGraph's [pre-built ReAct agent constructor](https://langchain-ai.github.io/langgraph/how-tos/#langgraph.prebuilt.chat_agent_executor.create_react_agent), we can do this in one line.
+
+:::tip
+
+Check out LangGraph's [SQL Agent Tutorial](https://langchain-ai.github.io/langgraph/tutorials/sql-agent/) for a more advanced formulation of a SQL agent.
+
+:::
+
+The `SQLDatabaseToolkit` includes tools that can:
+
+* Create and execute queries
+* Check query syntax
+* Retrieve table descriptions
+* ... and more
+
+from langchain_community.agent_toolkits import SQLDatabaseToolkit
+
+toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+
+tools = toolkit.get_tools()
+
+tools
+
+### System Prompt
+
+We will also want to load a system prompt for our agent. This will consist of instructions for how to behave.
+
+from langchain import hub
+
+prompt_template = hub.pull("langchain-ai/sql-agent-system-prompt")
+
+assert len(prompt_template.messages) == 1
+prompt_template.messages[0].pretty_print()
+
+Let's populate the parameters highlighted in the prompt:
+
+system_message = prompt_template.format(dialect="SQLite", top_k=5)
+
+### Initializing agent
+
+We will use a prebuilt [LangGraph](/docs/concepts/architecture/#langgraph) agent to build our agent
+
+from langchain_core.messages import HumanMessage
+from langgraph.prebuilt import create_react_agent
+
+agent_executor = create_react_agent(llm, tools, state_modifier=system_message)
+
+Consider how the agent responds to the below question:
+
+question = "Which country's customers spent the most?"
+
+for step in agent_executor.stream(
+    {"messages": [{"role": "user", "content": question}]},
+    stream_mode="values",
+):
+    step["messages"][-1].pretty_print()
+
+You can also use the [LangSmith trace](https://smith.langchain.com/public/8af422aa-b651-4bfe-8683-e2a7f4ccd82c/r) to visualize these steps and associated metadata.
+
+Note that the agent executes multiple queries until it has the information it needs:
+1. List available tables;
+2. Retrieves the schema for three tables;
+3. Queries multiple of the tables via a join operation.
+
+The agent is then able to use the result of the final query to generate an answer to the original question.
+
+The agent can similarly handle qualitative questions:
+
+question = "Describe the playlisttrack table"
+
+for step in agent_executor.stream(
+    {"messages": [{"role": "user", "content": question}]},
+    stream_mode="values",
+):
+    step["messages"][-1].pretty_print()
+
+### Dealing with high-cardinality columns
+
+In order to filter columns that contain proper nouns such as addresses, song names or artists, we first need to double-check the spelling in order to filter the data correctly. 
+
+We can achieve this by creating a vector store with all the distinct proper nouns that exist in the database. We can then have the agent query that vector store each time the user includes a proper noun in their question, to find the correct spelling for that word. In this way, the agent can make sure it understands which entity the user is referring to before building the target query.
+
+First we need the unique values for each entity we want, for which we define a function that parses the result into a list of elements:
+
+import ast
+import re
+
+
+def query_as_list(db, query):
+    res = db.run(query)
+    res = [el for sub in ast.literal_eval(res) for el in sub if el]
+    res = [re.sub(r"\b\d+\b", "", string).strip() for string in res]
+    return list(set(res))
+
+
+artists = query_as_list(db, "SELECT Name FROM Artist")
+albums = query_as_list(db, "SELECT Title FROM Album")
+albums[:5]
+
+Using this function, we can create a **retriever tool** that the agent can execute at its discretion.
+
+Let's select an [embeddings model](/docs/integrations/text_embedding/) and [vector store](/docs/integrations/vectorstores/) for this step:
+
+**Select an embedding model**:
+
+import EmbeddingTabs from "@theme/EmbeddingTabs";
+
+<EmbeddingTabs/>
+
+# | output: false
+# | echo: false
+
+from langchain_openai import OpenAIEmbeddings
+
+embeddings = OpenAIEmbeddings()
+
+**Select a vector store**:
+
+import VectorStoreTabs from "@theme/VectorStoreTabs";
+
+<VectorStoreTabs/>
+
+# | output: false
+# | echo: false
+
+from langchain_core.vectorstores import InMemoryVectorStore
+
+vector_store = InMemoryVectorStore(embeddings)
+
+We can now construct a retrieval tool that can search over relevant proper nouns in the database:
+
+from langchain.agents.agent_toolkits import create_retriever_tool
+
+_ = vector_store.add_texts(artists + albums)
+retriever = vector_store.as_retriever(search_kwargs={"k": 5})
+description = (
+    "Use to look up values to filter on. Input is an approximate spelling "
+    "of the proper noun, output is valid proper nouns. Use the noun most "
+    "similar to the search."
+)
+retriever_tool = create_retriever_tool(
+    retriever,
+    name="search_proper_nouns",
+    description=description,
+)
+
+Let's try it out:
+
+print(retriever_tool.invoke("Alice Chains"))
+
+This way, if the agent determines it needs to write a filter based on an artist along the lines of "Alice Chains", it can first use the retriever tool to observe relevant values of a column.
+
+Putting this together:
+
+# Add to system message
+suffix = (
+    "If you need to filter on a proper noun like a Name, you must ALWAYS first look up "
+    "the filter value using the 'search_proper_nouns' tool! Do not try to "
+    "guess at the proper name - use this function to find similar ones."
+)
+
+system = f"{system_message}\n\n{suffix}"
+
+tools.append(retriever_tool)
+
+agent = create_react_agent(llm, tools, state_modifier=system)
+
+question = "How many albums does alis in chain have?"
+
+for step in agent.stream(
+    {"messages": [{"role": "user", "content": question}]},
+    stream_mode="values",
+):
+    step["messages"][-1].pretty_print()
+
+As we can see, both in the streamed steps and in the [LangSmith trace](https://smith.langchain.com/public/1d757ed2-5688-4458-9400-023594e2c5a7/r), the agent used the `search_proper_nouns` tool in order to check how to correctly query the database for this specific artist.
+
